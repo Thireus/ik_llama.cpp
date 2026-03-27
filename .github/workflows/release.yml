@@ -271,7 +271,7 @@ jobs:
           name: llama-${{ steps.tag.outputs.name }}-bin-ubuntu-vulkan-x64.zip
 
   windows-cpu:
-    #if: false # Not ready yet
+    if: false # Not ready yet
     runs-on: windows-2022
 
     strategy:
@@ -1062,7 +1062,7 @@ jobs:
 
     needs:
       #- windows
-      - windows-cpu
+      #- windows-cpu
       - windows-cpu-clang
       #- windows-cuda
       #- windows-sycl
@@ -1132,9 +1132,6 @@ jobs:
 
             **Linux:**
             - [llama-quantize for Ubuntu x64 (CPU)](https://github.com/Thireus/ik_llama.cpp/releases/download/${{ steps.tag.outputs.name }}/ik_llama-${{ steps.tag.outputs.name }}-bin-ubuntu-x64.zip)
-
-            **Windows MSVC:**
-            - [llama-quantize for Windows x64 (CPU)](https://github.com/Thireus/ik_llama.cpp/releases/download/${{ steps.tag.outputs.name }}/ik_llama-${{ steps.tag.outputs.name }}-bin-win-cpu-x64.zip)
 
             ---
             ### Experimental Windows Clang builds can be found below
