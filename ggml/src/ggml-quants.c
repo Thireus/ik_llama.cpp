@@ -689,7 +689,7 @@ void quantize_row_q4_0_ref(const float * restrict x, block_q4_0 * restrict y, in
             }
         }
 
-        const float d  = max / -8;
+        const float d  = max / -7;
         const float id = d ? 1.0f/d : 0.0f;
 
         y[i].d = GGML_FP32_TO_FP16(d);
@@ -2713,79 +2713,231 @@ size_t quantize_q3_K(const float * restrict src, void * restrict dst, int64_t nr
 
 // ====================== 4-bit (de)-quantization
 
-void quantize_row_q4_K_ref(const float * restrict x, block_q4_K * restrict y, int64_t k) {
-    assert(k % QK_K == 0);
-    const int nb = k / QK_K;
+static inline void set_scale_min_k4(int j, uint8_t * GGML_RESTRICT q, uint8_t d, uint8_t m) {
+    assert(d < 64 && m < 64);
+    if (j < 4) {
+        q[j] = (q[j] & 0xC0) | (d & 0x3F);
+        q[j + 4] = (q[j + 4] & 0xC0) | (m & 0x3F);
+    } else {
+        const int j2 = j - 4;
+        q[j2] = (q[j2] & 0x3F) | ((d & 0x30) << 2);
+        q[j + 4] = (d & 0x0F) | ((m & 0x0F) << 4);
+        q[j] = (q[j] & 0x3F) | ((m & 0x30) << 2);
+    }
+}
 
-    uint8_t L[QK_K];
-    uint8_t Laux[32];
-    float   weights[32];
-    float mins[QK_K/32];
-    float scales[QK_K/32];
+void quantize_row_q4_K_ref(const float * GGML_RESTRICT x, block_q4_K * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    
+    const int max_iter = 10;
+    const float epsilon = 1e-6f;   
+
+    const int nb = k / QK_K;
+    const int num_subblocks = QK_K / 32;
 
     for (int i = 0; i < nb; i++) {
-        float max_scale = 0; // as we are deducting the min, scales are always positive
-        float max_min = 0;
-        for (int j = 0; j < QK_K/32; ++j) {
-            //scales[j] = make_qkx1_quants(32, 15, x + 32*j, L + 32*j, &mins[j], 9, 0.5f);
-            float sum_x2 = 0;
-            for (int l = 0; l < 32; ++l) sum_x2 += x[32*j + l] * x[32*j + l];
-            float av_x = sqrtf(sum_x2/32);
-            for (int l = 0; l < 32; ++l) weights[l] = av_x + fabsf(x[32*j + l]);
-            scales[j] = make_qkx2_quants(32, 15, x + 32*j, weights, L + 32*j, &mins[j], Laux, -1.f, 0.1f, 20, false);
-            if (isnan(scales[j])) {
-                printf("Oops: NaN scale\n");
-                GGML_ABORT("Fatal error");
+        memset(y[i].scales, 0, K_SCALE_SIZE);
+        
+        float scales[num_subblocks];
+        float mins[num_subblocks];
+        
+        // Initialization: compute initial scales and mins per sub-block
+        for (int j = 0; j < num_subblocks; j++) {
+            float xmin = x[i*QK_K + j*32];
+            float xmax = x[i*QK_K + j*32];
+            
+            for (int l = 1; l < 32; l++) {
+                const float v = x[i*QK_K + j*32 + l];
+                xmin = v < xmin ? v : xmin;
+                xmax = v > xmax ? v : xmax;
             }
-            float scale = scales[j];
-            if (scale > max_scale) {
-                max_scale = scale;
+            
+            // note: kimi-k2-thinking QAT-specific initialisation
+            scales[j] = MAX(fabsf(xmin), fabsf(xmax)) / 7.0f;
+            mins[j] = -7.0f * scales[j];
+
+            if (scales[j] == 0.0f) scales[j] = 1.0f;
+        }
+        
+        // Initialize super-block scales
+        float d = 0.0f;
+        float dmin_abs = 0.0f;
+        for (int j = 0; j < num_subblocks; j++) {
+            d = scales[j] > d ? scales[j] : d;
+            const float mins_abs = fabsf(mins[j]);
+            dmin_abs = mins_abs > dmin_abs ? mins_abs : dmin_abs;
+        }
+        d = d / 63.0f;
+        float dmin = dmin_abs / 63.0f;
+        if (d == 0.0f) d = 1.0f;
+        if (dmin == 0.0f) dmin = 1.0f;
+        
+        // Quantize initial sub-block scales and mins
+        uint8_t sc[num_subblocks];
+        uint8_t m[num_subblocks];
+        for (int j = 0; j < num_subblocks; j++) {
+            sc[j] = (uint8_t)(nearest_int(scales[j] / d));
+            sc[j] = sc[j] > 63 ? 63 : sc[j];
+            
+            const int m_int = nearest_int(mins[j] / dmin);
+            m[j] = (uint8_t)(m_int < 0 ? -m_int : m_int);
+            m[j] = m[j] > 63 ? 63 : m[j];
+            
+            set_scale_min_k4(j, y[i].scales, sc[j], m[j]);
+        }
+        
+        // Adjust dmin sign based on typical min values
+        float avg_min = 0.0f;
+        for (int j = 0; j < num_subblocks; j++) avg_min += mins[j];
+        avg_min /= num_subblocks;
+        if (avg_min > 0.0f) dmin = -dmin;
+        
+        // Temporary storage for 4-bit codes
+        uint8_t q[QK_K];
+        
+        // Lloyd-Max iteration
+        for (int iter = 0; iter < max_iter; iter++) {
+            const float d_old = d;
+            const float dmin_old = dmin;
+            
+            // Step 1: Assignment - quantize to 4-bit codes
+            for (int j = 0; j < num_subblocks; j++) {
+                const float scale = d * sc[j];
+                const float offset = -dmin * m[j];
+                
+                if (scale == 0.0f) {
+                    for (int l = 0; l < 32; ++l) { 
+                        q[j*32 + l] = 0;
+                    }
+                    continue;
+                }
+                
+                for (int l = 0; l < 32; l++) {
+                    const float v = x[i*QK_K + j*32 + l];
+                    const int q_int = nearest_int((v - offset) / scale);
+
+                    // note: kimi-k2-thinking QAT-specific clipping
+                    q[j*32 + l] = (uint8_t)(q_int < 0 ? 0 : (q_int > 14 ? 14 : q_int));
+                }
             }
-            float min = mins[j];
-            if (min > max_min) {
-                max_min = min;
+            
+            // Step 2: Update sub-block scales and mins (2D least squares per sub-block)
+            for (int j = 0; j < num_subblocks; j++) {
+                float sum_x = 0.0f;
+                float sum_q = 0.0f;
+                float sum_xq = 0.0f;
+                float sum_qq = 0.0f;
+                
+                for (int l = 0; l < 32; l++) {
+                    const float xv = x[i*QK_K + j*32 + l];
+                    const float qv = (float)q[j*32 + l];
+                    sum_x += xv;
+                    sum_q += qv;
+                    sum_xq += xv * qv;
+                    sum_qq += qv * qv;
+                }
+                
+                const float n = 32.0f;
+                const float det = n * sum_qq - sum_q * sum_q;
+                
+                if (det > 0.0f) {
+                    const float a = (n * sum_xq - sum_x * sum_q) / det;
+                    const float b = (sum_x - a * sum_q) / n;
+                    
+                    if (a > 0.0f && d > 0.0f) {
+                        const int sc_new = nearest_int(a / d);
+                        sc[j] = (uint8_t)(sc_new < 0 ? 0 : (sc_new > 63 ? 63 : sc_new));
+                    }
+                    
+                    if (dmin != 0.0f) {
+                        const int m_new = nearest_int(-b / dmin);
+                        m[j] = (uint8_t)(m_new < 0 ? 0 : (m_new > 63 ? 63 : m_new));
+                    }
+                    
+                    set_scale_min_k4(j, y[i].scales, sc[j], m[j]);
+                }
+            }
+            
+            // Step 3: Update super-block scales (2D least squares across all sub-blocks)
+            float A = 0.0f;   // Σ(sc*q)²
+            float B = 0.0f;   // Σ(m*sc*q)
+            float C = 0.0f;   // Σm²
+            float X_d = 0.0f; // Σ(x*sc*q)
+            float X_m = 0.0f; // Σ(x*m)
+            
+            for (int j = 0; j < num_subblocks; j++) {
+                float sum_sq = 0.0f;
+                float sum_q = 0.0f;
+                float sum_xq = 0.0f;
+                float sum_x = 0.0f;
+                
+                for (int l = 0; l < 32; l++) {
+                    const float xv = x[i*QK_K + j*32 + l];
+                    const float qv = (float)q[j*32 + l];
+                    sum_sq += qv * qv;
+                    sum_q += qv;
+                    sum_xq += xv * qv;
+                    sum_x += xv;
+                }
+                
+                const float sc_f = (float)sc[j];
+                const float m_f = (float)m[j];
+                
+                A += sc_f * sc_f * sum_sq;
+                B += m_f * sc_f * sum_q;
+                C += m_f * m_f * 32.0f;
+                X_d += sc_f * sum_xq;
+                X_m += m_f * sum_x;
+            }
+            
+            const float det = A * C - B * B;
+            
+            if (det > 0.0f) {
+                const float d_new = (C * X_d - B * X_m) / det;
+                const float dmin_new = (B * X_d - A * X_m) / det;
+                
+                if (d_new > 0.0f) {
+                    d = d_new;
+                }
+                if (dmin_new != 0.0f) {
+                    dmin = dmin_new;
+                }
+            }
+            
+            // Check convergence
+            const float delta_d = fabsf(d - d_old);
+            const float delta_dmin = fabsf(dmin - dmin_old);
+            
+            if (delta_d < epsilon && delta_dmin < epsilon) {
+                break;
             }
         }
+        
+        // Final assignment with converged parameters
+        for (int j = 0; j < num_subblocks; j++) {
+            const float scale = d * sc[j];
+            const float offset = -dmin * m[j];
+            
+            for (int l = 0; l < 32; l++) {
+                const float v = x[i*QK_K + j*32 + l];
+                const int q_int = scale != 0.0f ? nearest_int((v - offset) / scale) : 0;
 
-        float inv_scale = max_scale > 0 ? 63.f/max_scale : 0.f;
-        float inv_min   = max_min   > 0 ? 63.f/max_min   : 0.f;
-        for (int j = 0; j < QK_K/32; ++j) {
-            uint8_t ls = nearest_int(inv_scale*scales[j]);
-            uint8_t lm = nearest_int(inv_min*mins[j]);
-            ls = MIN(63, ls);
-            lm = MIN(63, lm);
-            if (j < 4) {
-                y[i].scales[j] = ls;
-                y[i].scales[j+4] = lm;
-            } else {
-                y[i].scales[j+4] = (ls & 0xF) | ((lm & 0xF) << 4);
-                y[i].scales[j-4] |= ((ls >> 4) << 6);
-                y[i].scales[j-0] |= ((lm >> 4) << 6);
+                // note: kimi-k2-thinking QAT-specific clipping
+                q[j*32 + l] = (uint8_t)(q_int < 0 ? 0 : (q_int > 14 ? 14 : q_int));
             }
         }
-        y[i].d = GGML_FP32_TO_FP16(max_scale/63.f);
-        y[i].dmin = GGML_FP32_TO_FP16(max_min/63.f);
-
-        uint8_t sc, m;
-        for (int j = 0; j < QK_K/32; ++j) {
-            get_scale_min_k4(j, y[i].scales, &sc, &m);
-            const float d = GGML_FP16_TO_FP32(y[i].d) * sc;
-            if (!d) continue;
-            const float dm = GGML_FP16_TO_FP32(y[i].dmin) * m;
-            for (int ii = 0; ii < 32; ++ii) {
-                int l = nearest_int((x[32*j + ii] + dm)/d);
-                l = MAX(0, MIN(15, l));
-                L[32*j + ii] = l;
+        
+        // Store final super-block scales
+        y[i].d = GGML_FP32_TO_FP16(d);
+        y[i].dmin = GGML_FP32_TO_FP16(dmin);
+               
+        // Pack 4-bit quantized values (layout expected by dequant)
+        uint8_t *qs = y[i].qs;
+        for (int base = 0, out = 0; base < QK_K; base += 64, out += 32) {
+            for (int l = 0; l < 32; ++l) {
+                qs[out + l] = (q[base + l] & 0x0F) | ((q[base + 32 + l] & 0x0F) << 4);
             }
         }
-
-        uint8_t * q = y[i].qs;
-        for (int j = 0; j < QK_K; j += 64) {
-            for (int l = 0; l < 32; ++l) q[l] = L[j + l] | (L[j + l + 32] << 4);
-            q += 32;
-        }
-
-        x += QK_K;
     }
 }
 
