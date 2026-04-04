@@ -34,7 +34,8 @@ llm_build_context::llm_build_context(
     const llama_batch  & batch,
     const llm_build_cb & cb,
     bool   worst_case,
-    bool   warmup) :
+    bool   warmup,
+    int    n_outputs_) :
         model            (lctx.model),
         lctx             (lctx),
         hparams          (model.hparams),
@@ -63,7 +64,7 @@ llm_build_context::llm_build_context(
         norm_rms_eps     (hparams.f_norm_rms_eps),
         n_tokens         (batch.n_tokens),
         n_kv             (worst_case ? kv_self.size : kv_self.n),
-        n_outputs        (worst_case ? n_tokens : lctx.n_outputs),
+        n_outputs        (worst_case ? n_outputs_ > 0 ? n_outputs_ : n_tokens : lctx.n_outputs),
         n_outputs_enc    (worst_case ? n_tokens : lctx.embd_enc.size() / hparams.n_embd),
         kv_head          (worst_case ? (kv_self.recurrent ? 0 : kv_self.size - n_tokens) : kv_self.head),
         n_ctx_orig       (cparams.n_ctx_orig_yarn),
@@ -308,17 +309,17 @@ struct ggml_tensor * llm_build_context::build_inp_embd_mtp(struct ggml_tensor * 
 
     if (batch.token) {
         lctx.inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, batch.n_tokens);
-        
+
         cb(lctx.inp_tokens, "inp_tokens", -1);
         ggml_set_input(lctx.inp_tokens);
 
         cur = ggml_get_rows(ctx0, mtp_tok_embd, lctx.inp_tokens);
     } else {
-        return nullptr; 
+        return nullptr;
     }
 
     cb(cur, "inp_embd", -1);
-    
+
     return cur;
 }
 
@@ -1581,6 +1582,10 @@ static ggml_tensor * llm_build_kqv(
         }
         //ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
 
+        if (cparams.v_cache_hadamard) {
+            cur = ggml_hadamard(ctx, cur, n_embd_head_v);
+            cb(cur, "fa_h", il);
+        }
         cur = ggml_reshape_2d(ctx, cur, n_embd_head_v*n_head, n_tokens);
     } else {
 
@@ -1743,6 +1748,9 @@ ggml_tensor * llm_build_context::llm_build_kv(
         k_cur = ggml_hadamard(ctx, k_cur, hparams.n_embd_head_k);
         cb(q_cur, "Qcur_hadamard", il);
         cb(k_cur, "Kcur_hadamard", il);
+    }
+    if (cparams.v_cache_hadamard) {
+        v_cur = ggml_hadamard(ctx, v_cur, hparams.n_embd_head_v);
     }
 
     // these nodes are added to the graph together so that they are not reordered
@@ -7550,47 +7558,21 @@ struct ggml_tensor * llm_build_context::build_mtp_tail(
     ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
     cb(ffn_inp, "mtp_ffn_inp", il);
 
-    cur = llm_build_norm(ctx0, ffn_inp, hparams, mtp_layer.attn_post_norm, NULL, LLM_NORM_RMS, cb, il);
-    cb(cur, "attn_post_norm", il);
+    cur = llm_build_std_moe_ffn(ctx0, lctx, mtp_layer.ffn_norm, ffn_inp,
+                    mtp_layer.ffn_gate_inp,  NULL,
+                    mtp_layer.ffn_up_exps,   NULL,
+                    mtp_layer.ffn_gate_exps, NULL,
+                    mtp_layer.ffn_down_exps, NULL,
+                    mtp_layer.ffn_exp_probs_b,
+                    mtp_layer.ffn_up_shexp,    nullptr,
+                    mtp_layer.ffn_gate_shexp,  nullptr,
+                    mtp_layer.ffn_down_shexp,  nullptr,
+                    n_expert, n_expert_used,
+                    LLM_FFN_SILU, hparams.expert_weights_norm, true, hparams.expert_weights_scale,
+                    (llm_expert_gating_func_type) hparams.expert_gating_func,
+                    LLM_FFN_SILU, cb, il, gf, true, mtp_layer.ffn_up_gate_exps);
+    cb(cur, "ffn_out", il);
 
-    // moe ffn for nextn block
-    {
-        // Routed Experts
-        ggml_tensor * routed_out = llm_build_std_moe_ffn(ctx0, lctx, 
-                        NULL, // Norm handled above
-                        cur,  // Input (Normed)
-                        mtp_layer.ffn_gate_inp,  NULL,
-                        mtp_layer.ffn_up_exps,   NULL,
-                        mtp_layer.ffn_gate_exps, NULL,
-                        mtp_layer.ffn_down_exps, NULL,
-                        mtp_layer.ffn_exp_probs_b,
-                        nullptr,    nullptr, // we don't have shared expert biases?
-                        nullptr,  nullptr,
-                        nullptr,  nullptr,
-                        n_expert, n_expert_used,
-                        LLM_FFN_SILU, hparams.expert_weights_norm, true, hparams.expert_weights_scale,
-                        (llm_expert_gating_func_type) hparams.expert_gating_func,
-                        LLM_FFN_SILU, cb, il, gf, true, mtp_layer.ffn_up_gate_exps);
-        cb(routed_out, "ffn_moe_out", il);
-
-        // Shared Expert FFN
-        ggml_tensor * shared_out = llm_build_ffn(ctx0, lctx, 
-                NULL, // Norm handled above
-                cur,  // Input
-                mtp_layer.ffn_up_shexp,   NULL, NULL,
-                mtp_layer.ffn_gate_shexp, NULL, NULL,
-                mtp_layer.ffn_down_shexp, NULL, NULL,
-                NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, true);
-        cb(shared_out, "ffn_shexp_out", il);
-
-        // Sum and Residual
-        cur = ggml_add(ctx0, routed_out, shared_out);
-        cb(cur, "ffn_out", il);
-
-        cur = ggml_add(ctx0, cur, ffn_inp);
-        cb(cur, "mtp_ffn_out_resid", il);
-    }
     cur = llm_build_norm(ctx0, cur, hparams, mtp_layer.nextn.shared_head_norm, NULL, LLM_NORM_RMS, cb, il);
     cb(cur, "result_norm", -1);
 
@@ -9322,6 +9304,11 @@ ggml_cgraph* llm_build_context::build_minimaxm2() {
                 }
                 ggml_build_forward_expand(gf, Qcur);
                 ggml_build_forward_expand(gf, Kcur);
+                if (cparams.v_cache_hadamard) {
+                    Vcur = ggml_hadamard(ctx0, Vcur, hparams.n_embd_head_v);
+                    cb(Vcur, "Vcur_hadamard", il_id);
+                    ggml_build_forward_expand(gf, Vcur);
+                }
 
                 // Store K, V in KV cache
                 auto idx = 2*wq->n_device*il + 2*id;
@@ -9611,7 +9598,8 @@ struct ggml_cgraph * llm_build_context::llama_build_graph_s_copy(llama_context &
 ggml_cgraph * llm_build_context::llama_build_graph(
          llama_context & lctx,
      const llama_batch & batch,
-                  bool   worst_case) {
+                  bool   worst_case,
+                  int    n_outputs) {
     const auto & model = lctx.model;
 
 #if IK_PRINT_TIMING
@@ -9668,7 +9656,7 @@ ggml_cgraph * llm_build_context::llama_build_graph(
     llama_token bos = vocab->token_bos();
     llama_token eos = vocab->token_eos();
     bool is_warming_up = lctx.n_eval == 0 && (batch.n_tokens == 1 && (batch.token[0] == ((bos != -1) ? bos : eos)));
-    struct llm_build_context llm(lctx, batch, cb, worst_case, is_warming_up);
+    struct llm_build_context llm(lctx, batch, cb, worst_case, is_warming_up, n_outputs);
 
     llm.init();
 
@@ -10093,6 +10081,10 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                     cb(Qcur, "Qcur_hadamard", il_cb);
                     cb(Kcur, "Kcur_hadamard", il_cb);
                 }
+                if (cparams.v_cache_hadamard) {
+                    Vcur = ggml_hadamard(ctx0, Vcur, hparams.n_embd_head_v);
+                    cb(Vcur, "Vcur_hadamard", il_cb);
+                }
                 ggml_build_forward_expand(gf, Qcur);
                 ggml_build_forward_expand(gf, Kcur);
                 ggml_build_forward_expand(gf, Vcur);
@@ -10164,6 +10156,11 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 // Some models produced NaNs/gibberish when FA is computed with f16 precision on CUDA
                 if (should_use_f32_precision) {
                     ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+                }
+
+                if (cparams.v_cache_hadamard) {
+                    cur = ggml_hadamard(ctx0, cur, n_embd_head_v);
+                    cb(cur, "flash_attn_h", il_cb);
                 }
 
                 if (model.layers[il].wqkv_gate) {

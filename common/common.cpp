@@ -499,6 +499,7 @@ void gpt_params_parse_from_env(gpt_params & params) {
     get_env("LLAMA_ARG_CACHE_TYPE_V",     params.cache_type_v);
     get_env("LLAMA_ARG_MLOCK",            params.use_mlock);
     get_env("LLAMA_ARG_K_CACHE_HADAMARD", params.k_cache_hadamard);
+    get_env("LLAMA_ARG_V_CACHE_HADAMARD", params.v_cache_hadamard);
 
 }
 
@@ -1180,6 +1181,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.mmproj_use_gpu = false;
         return true;
     }
+    if (arg == "--mtmd-kq-type") {
+        CHECK_ARG
+        params.mtmd_kq_type = argv[i];
+        return true;
+    }
     if (arg == "--image" || arg == "--audio") {
         CHECK_ARG
         params.image.emplace_back(argv[i]);
@@ -1516,6 +1522,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
+    if (arg == "-wgt" || arg == "--worst-graph-tokens") {
+        CHECK_ARG;
+        params.worst_graph_tokens = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "--no-mmap") {
         params.use_mmap = false;
         return true;
@@ -1543,6 +1554,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     }
     if (arg == "-khad" || arg == "--k-cache-hadamard") {
         params.k_cache_hadamard = true;
+        return true;
+    }
+    if (arg == "-vhad" || arg == "--v-cache-hadamard") {
+        params.v_cache_hadamard = true;
         return true;
     }
     if (arg == "-smgs" || arg == "--split-mode-graph-scheduling") {
@@ -2313,6 +2328,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",         "-mqkv,  --merge-qkv,",            "merge Q,K,V (default: %d)", params.merge_qkv});
     options.push_back({ "*",         "-muge,  --merge-up-gate-experts,","merge ffn_up/gate_exps (default: %d)", params.merge_up_gate_exps});
     options.push_back({ "*",         "-khad,  --k-cache-hadamard,",     "Use Hadamard transform for K-cache (default: %d)", params.k_cache_hadamard});
+    options.push_back({ "*",         "-vhad,  --v-cache-hadamard,",     "Use Hadamard transform for V-cache (default: %d)", params.v_cache_hadamard});
     options.push_back({ "*",         "-smf16, --split-mode-f16,",       "Use f16 for data exchange between GPUs (default: %d)", true});
     options.push_back({ "*",         "-smf32, --split-mode-f32,",       "Use f32 for data exchange between GPUs (default: %d)", false});
     options.push_back({ "*",         "-grt, --graph-reduce-type",       "Type for data exchange between GPUs (default: %s)", "f32"});
@@ -2478,9 +2494,10 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "multi-modality" });
     options.push_back({ "*",           "       --mmproj FILE",          "path to a multimodal projector file for LLaVA. see examples/llava/README.md" });
     options.push_back({ "*",           "       --image FILE",           "path to an image file. use with multimodal models. Specify multiple times for batching" });
-    options.push_back({ "*",           "       --image-min-tokens N",           "minimum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)"});
-    options.push_back({ "*",           "       --image-max-tokens N",           "maximum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)" });
-    options.push_back({ "*",           "       --no-context-shift",           "disable context-shift." });
+    options.push_back({ "*",           "       --image-min-tokens N",   "minimum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)"});
+    options.push_back({ "*",           "       --image-max-tokens N",   "maximum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)" });
+    options.push_back({ "*",           "       --mtmd-kq-type TYPE",    "data type for multimodality K*Q (default: %s)", params.mtmd_kq_type.c_str() });
+    options.push_back({ "*",           "       --no-context-shift",     "disable context-shift." });
     options.push_back({ "*",           "--context-shift (auto|on|off|0|1)", "set context-shift (default: %s)", params.ctx_shift ? "on" : "off" });
     options.push_back({ "backend" });
     options.push_back({ "*",           "       --rpc SERVERS",          "comma separated list of RPC servers" });
@@ -2496,6 +2513,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       --cpu-moe",              "keep all MoE weights in CPU memory"});
     options.push_back({ "*",           "       --n-cpu-moe N",          "keep MoE weights of the first N layers in CPU memory"});
     options.push_back({ "*",           "       --fit-margin N",         "safety margin in MiB when auto-fitting model offloading"});
+    options.push_back({ "*",           "-wgt, --worst-graph-tokens N",  "number of tokens to use for worst-case graph"});
     options.push_back({ "*",           "       --fit",                  "automatically determine which tensors to offload to the GPU(s)"});
     options.push_back({ "*",           "       --numa TYPE",            "attempt optimizations that help on some NUMA systems\n"
                                                                         "  - distribute: spread execution evenly over all nodes\n"
@@ -3331,6 +3349,7 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     mparams.ncmoe           = params.ncmoe;
     mparams.fit             = params.fit;
     mparams.fit_margin      = params.fit_margin;
+    mparams.worst_graph_tokens = params.worst_graph_tokens;
     mparams.type_k          = kv_cache_type_from_str(params.cache_type_k);
     mparams.type_v          = kv_cache_type_from_str(params.cache_type_v);
     mparams.max_ctx_size    = params.n_ctx;
@@ -3398,6 +3417,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.seed              = params.seed;
     cparams.logits_all        = params.logits_all;
     cparams.embeddings        = params.embedding;
+    cparams.worst_case_tokens = params.worst_graph_tokens;
     cparams.rope_scaling_type = params.rope_scaling_type;
     cparams.rope_freq_base    = params.rope_freq_base;
     cparams.rope_freq_scale   = params.rope_freq_scale;
@@ -3422,6 +3442,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.rope_cache        = params.rope_cache;
     cparams.graph_reuse       = params.graph_reuse;
     cparams.k_cache_hadamard  = params.k_cache_hadamard;
+    cparams.v_cache_hadamard  = params.v_cache_hadamard;
     cparams.split_mode_graph_scheduling = params.split_mode_graph_scheduling;
     //cparams.split_mode_f16    = params.split_mode_f16;
     cparams.scheduler_async   = params.scheduler_async;
@@ -4379,6 +4400,7 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "ncmoe: %d # default: 0\n", params.ncmoe);
     fprintf(stream, "fit: %d # default: false\n", params.fit);
     fprintf(stream, "fit_margin: %d # default: 0\n", params.fit_margin);
+    fprintf(stream, "worst_graph_tokens: %d # default: 0\n", params.worst_graph_tokens);
     fprintf(stream, "min_keep: %d # default: 0 (disabled)\n", sparams.min_keep);
     fprintf(stream, "mirostat: %d # default: 0 (disabled)\n", sparams.mirostat);
     fprintf(stream, "mirostat_ent: %f # default: 5.0\n", sparams.mirostat_tau);
@@ -4437,6 +4459,7 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "rope_cache: %s # default: false\n", params.rope_cache ? "true" : "false");
     fprintf(stream, "graph_reuse: %s # default: false\n", params.graph_reuse ? "true" : "false");
     fprintf(stream, "k_cache_hadamard: %s # default: false\n", params.k_cache_hadamard ? "true" : "false");
+    fprintf(stream, "v_cache_hadamard: %s # default: false\n", params.v_cache_hadamard ? "true" : "false");
     fprintf(stream, "split_mode_graph_scheduling: %s # default: false\n", params.split_mode_graph_scheduling ? "true" : "false");
     //fprintf(stream, "split_mode_f16: %s # default: true\n", params.split_mode_f16 ? "true" : "false");
     fprintf(stream, "reduce_type: %s # default f16\n", params.reduce_type.c_str());
