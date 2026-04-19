@@ -699,6 +699,7 @@ extern "C" {
         GGML_OP_REDUCE,
         GGML_OP_FAKE_CPY,
         GGML_OP_FUSED_NORM,
+        GGML_OP_FUSED_RMS_RMS_ADD,
 
         GGML_OP_COUNT,
     };
@@ -1569,6 +1570,14 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_l2_norm_inplace(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
+            float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_fused_rms_rms_add(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x1,
+            struct ggml_tensor  * c1,
+            struct ggml_tensor  * x2,
+            struct ggml_tensor  * c2,
             float                 eps);
 
     // a - x

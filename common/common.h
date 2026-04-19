@@ -146,6 +146,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_SUFFIX,        // self-speculative suffix-decoding (arXiv:2411.04975)
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -182,6 +183,11 @@ struct common_params_speculative {
 
     std::shared_ptr<common_ngram_mod> ngram_mod;
 
+    // suffix-decoding specific
+    int32_t     suffix_min_match_len = 5;  // minimum context match length
+    int32_t     suffix_max_depth     = 64; // suffix tree maximum depth
+    std::string suffix_corpus;             // path to corpus file for offline pre-warming (.json or .bin)
+
     std::string lookup_cache_static;  // path of static ngram cache file for lookup decoding           // NOLINT
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding          // NOLINT
 
@@ -199,6 +205,8 @@ struct common_params_speculative {
     std::vector<std::pair<std::string, std::string>> replacements; // main to speculative model replacements
     std::string cache_type_k = ""; // KV cache data type for K for the draft model
     std::string cache_type_v = ""; // KV cache data type for V for the draft model
+
+    bool autotune = false; // automatically optimize speculative params for max tokens/sec
 
     bool has_dft() const {
         return !model.empty() || !params.empty();
@@ -283,8 +291,18 @@ struct gpt_params {
     std::vector<std::string> antiprompt;   // strings upon which more user input is prompted (a.k.a. reverse prompts)
     std::vector<std::string> ban_phrases;  // strings that are banned in generation
     int32_t banned_n                 =  1; // number of tokens that are banned in the phrase
-    size_t n_buffer 				 =  0; // number of token buffers for string ban
+    size_t n_buffer                  =  0; // number of token buffers for string ban
     bool can_ban_phrases             = true;  // whether to ban strings
+
+    std::vector<std::vector<std::tuple<
+        uint32_t        // lower codepoint
+        ,uint32_t       // upper codepoint
+        ,std::string    // unicode script name
+        ,float          // bias
+    >>> allow_ruless;
+    std::vector<std::string> allow_pieces;  // each token to allowlist
+    std::vector<std::string> allow_kws;     // keywords
+    size_t allow_kw_delay;  // minimum n_decoded before first keyword is active
 
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
@@ -358,6 +376,7 @@ struct gpt_params {
     bool only_active_exps  = true;  // if true, offload only active experts (relevant only for hybrid CPU/GPU)
     bool merge_qkv         = false; // if true, merge separate Q, K, V tensors into a single, contiguous tensor
     bool merge_up_gate_exps= false; // if true, merge ffn_up_exps and ffn_gate_exps into a single, contiguous tensor
+    bool defer_experts     = false; // if true, defer expert mmap residency to speed up model loading (Linux only)
     bool k_cache_hadamard  = false; // if true, use Hadamard transform for the K-cache (only makes sense with quantized cache)
     bool v_cache_hadamard  = false; // if true, use Hadamard transform for the V-cache (only makes sense with quantized cache, which requires FA)
     bool split_mode_graph_scheduling = false; // if true, force split mode graph scheduling
@@ -370,6 +389,15 @@ struct gpt_params {
     std::string cache_type_v = "f16"; // KV cache data type for the V
 
     std::string reduce_type = "f16";
+
+    std::string type_k_first = "f16";
+    std::string type_k_last  = "f16";
+    std::string type_v_first = "f16";
+    std::string type_v_last  = "f16";
+    int32_t     n_k_first    = -1;
+    int32_t     n_k_last     = -1;
+    int32_t     n_v_first    = -1;
+    int32_t     n_v_last     = -1;
 
     // multimodal models (see examples/mtmd)
     common_params_model mmproj;
@@ -724,3 +752,9 @@ void yaml_dump_non_result_info(
     const std::string & timestamp, const std::vector<int> & prompt_tokens, const char * model_desc);
 
 std::string string_format(const char* fmt, ...);
+
+//
+// Argparse utils
+//
+
+std::tuple<uint32_t, uint32_t, std::string, float> argparse_allowlist_unicode_rule(std::string argstr);

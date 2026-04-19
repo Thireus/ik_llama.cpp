@@ -56,6 +56,7 @@ struct server_slot {
     int32_t n_predict = -1; // TODO: disambiguate from params.n_predict
 
     int32_t n_prompt_tokens = 0;
+    int32_t n_prompt_tokens_cache = 0;
     int32_t n_prompt_tokens_processed = 0;
 
     json prompt; // can be either a string, array of strings or array of token ids
@@ -64,6 +65,7 @@ struct server_slot {
     server_tokens prompt_tokens;
     server_tokens cache_tokens;
 
+    int32_t last_gentxt_size = 0;
     std::string generated_text;
 
     // idx of draft tokens in the main batch
@@ -101,6 +103,15 @@ struct server_slot {
     float ban_phrases_bias = 0;
     int32_t banned_n = 1;
 	std::map<int32_t, std::set<llama_token>> positional_bans;
+
+    // allowlist
+    std::vector<std::vector<std::tuple<uint32_t, uint32_t, std::string, float>>> allow_ruless_prev;
+    std::vector<std::vector<std::tuple<uint32_t, uint32_t, std::string, float>>> allow_ruless;
+    std::vector<std::string> allow_pieces;
+    std::vector<std::string> allow_kws;
+    size_t allow_kw_delay = 0;
+    std::vector<std::vector<float>> allow_biasess;
+    size_t allow_idx = 0;
 
     server_prompt server_cached_prompt;
 
@@ -222,6 +233,8 @@ struct server_context {
     std::vector<llama_lora_adapter_container> lora_adapters;
     std::vector<control_vector_container> control_vectors;
 
+    std::vector<std::string> vocab_pieces;
+
     gpt_params params_base;
 
     llama_batch batch;
@@ -284,6 +297,8 @@ struct server_context {
 
     server_slot* get_available_slot(const server_task& task);
 
+    int32_t populate_vocab_pieces();
+
     bool launch_slot_with_task(server_slot& slot, server_task& task);
 
     void kv_cache_clear();
@@ -312,6 +327,8 @@ struct server_context {
     void send_final_response(server_slot& slot);
 
     void send_embedding(const server_slot& slot, const llama_batch& batch);
+
+    void apply_server_biases(server_slot& slot);
 
     void request_completion(int id_task, int id_multi, json data, bool infill, bool embedding, server_tokens&& inputs);
 
@@ -360,6 +377,8 @@ struct server_context {
     void send_token_results(completion_token_outputs& results, server_slot& slot, int32_t n = 0);
 
     void buffer_and_check_string_ban(server_slot& slot, completion_token_output& result);
+
+    void update_allowlist_state(server_slot& slot);
 
     json model_meta() const;
 

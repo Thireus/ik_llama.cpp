@@ -52,6 +52,9 @@
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
 #define LLAMA_STATE_SEQ_VERSION 3
 
+#define LLAMA_SERVER_MAGIC 0x6c6d7376u // 'lmsv'
+#define LLAMA_SERVER_VERSION 1 
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -382,6 +385,14 @@ extern "C" {
         int32_t  fit_margin;
         bool     fit;
         int32_t  worst_graph_tokens;
+        enum ggml_type type_k_first;
+        enum ggml_type type_k_last;
+        enum ggml_type type_v_first;
+        enum ggml_type type_v_last;
+        int32_t n_k_first;
+        int32_t n_k_last;
+        int32_t n_v_first;
+        int32_t n_v_last;
 
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
@@ -415,6 +426,7 @@ extern "C" {
         bool mtp;           // if true, load MTP layers if present
         bool dry_run;       // skip loading tensors
         bool flash_attn;
+        bool defer_experts;    // defer expert mmap residency to speed up model loading (Linux only)
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
@@ -450,6 +462,14 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
         enum ggml_type type_reduce; // data type for reduce operations
+        enum ggml_type type_k_first;
+        enum ggml_type type_k_last;
+        enum ggml_type type_v_first;
+        enum ggml_type type_v_last;
+        int32_t n_k_first;
+        int32_t n_k_last;
+        int32_t n_v_first;
+        int32_t n_v_last;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool logits_all;  // the llama_decode() call computes all logits, not just the last one (DEPRECATED - set llama_batch.logits instead)
@@ -1542,5 +1562,7 @@ const std::vector<std::pair<std::string, struct ggml_tensor *>> & llama_internal
 llama_token llama_sample_token_with_rng(struct llama_context * ctx, llama_token_data_array * candidates, std::mt19937 & rng);
 
 #endif // LLAMA_API_INTERNAL
+
+size_t llama_fill_from_utf8(void* utf8, void* cpts, void* scripts);
 
 #endif // LLAMA_H

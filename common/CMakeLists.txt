@@ -80,10 +80,14 @@ add_library(${TARGET} STATIC
 	peg-parser.cpp
     peg-parser.h
 	speculative.cpp
+    spec-tuner.cpp
+    spec-tuner.h
     unicode.cpp
     unicode.h
     ngram-mod.cpp
     ngram-mod.h
+    suffix-tree.cpp
+    suffix-tree.h
     regex-partial.cpp
     regex-partial.h
     jinja/lexer.cpp
