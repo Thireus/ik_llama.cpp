@@ -59,7 +59,7 @@ jobs:
             -DGGML_RPC=OFF \
             -DGGML_MAX_CONTEXTS=2048 \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
+          cmake --build build --config Release --target llama-imatrix -j $(sysctl -n hw.logicalcpu)
 
       - name: Determine tag name
         id: tag
@@ -130,7 +130,7 @@ jobs:
             -DGGML_MAX_CONTEXTS=2048 \
             -DGGML_METAL_NDEBUG=ON \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
+          cmake --build build --config Release --target llama-imatrix -j $(sysctl -n hw.logicalcpu)
 
       - name: Determine tag name
         id: tag
@@ -199,7 +199,7 @@ jobs:
             -DCURL_LIBRARY="%CURL_PATH%/lib/libcurl.dll.a" -DCURL_INCLUDE_DIR="%CURL_PATH%/include" \
             -DGGML_MAX_CONTEXTS=2048 \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(nproc)
+          cmake --build build --config Release --target llama-imatrix -j $(nproc)
 
       - name: Determine tag name
         id: tag
@@ -306,7 +306,7 @@ jobs:
             -DGGML_SCHED_MAX_COPIES=1 \
             -DGGML_MAX_CONTEXTS=2048 \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(nproc)
+          cmake --build build --config Release --target llama-imatrix -j $(nproc)
 
       - name: Determine tag name
         id: tag
@@ -416,7 +416,7 @@ jobs:
             -DGGML_MAX_CONTEXTS=2048 \
             -DGGML_CUDA_USE_GRAPHS=ON \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(nproc)
+          cmake --build build --config Release --target llama-imatrix -j $(nproc)
 
       - name: Determine tag name
         id: tag
@@ -998,7 +998,7 @@ jobs:
         id: cmake_build
         run: |
           cmake -S . -B build ${{ matrix.defines }} -DGGML_NATIVE=OFF -DLLAMA_CURL=OFF -DGGML_MAX_CONTEXTS=2048
-          cmake --build build --config Release --target ${{ matrix.target }}
+          cmake --build build --config Release --target llama-imatrix --target ${{ matrix.target }}
 
       - name: Determine tag name
         id: tag
@@ -1134,7 +1134,7 @@ jobs:
             ${{ env.CMAKE_ARGS }}
 
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
-          cmake --build build --config Release -j %NINJA_JOBS%
+          cmake --build build --config Release --target llama-imatrix --target llama-imatrix -j %NINJA_JOBS%
 
       - name: Determine tag name
         id: tag
@@ -1522,7 +1522,7 @@ jobs:
             ${{ env.CMAKE_ARGS }}
 
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
-          cmake --build build --config Release -j %NINJA_JOBS%
+          cmake --build build --config Release --target llama-imatrix -j %NINJA_JOBS%
 
       - name: Determine tag name
         id: tag
@@ -1772,7 +1772,7 @@ jobs:
             -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
             -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=ggml \
             -DGGML_MAX_CONTEXTS=2048
-          cmake --build build --config Release -j $(sysctl -n hw.logicalcpu) -- CODE_SIGNING_ALLOWED=NO
+          cmake --build build --config Release --target llama-imatrix -j $(sysctl -n hw.logicalcpu) -- CODE_SIGNING_ALLOWED=NO
 
       - name: xcodebuild for swift package
         id: xcodebuild
@@ -1809,17 +1809,17 @@ jobs:
 
     needs:
       #- windows
-      - windows-cpu
-      - windows-cpu-clang
+      #- windows-cpu
+      #- windows-cpu-clang
       - windows-cuda
-      - windows-cuda-clang
+      #- windows-cuda-clang
       #- windows-sycl
       #- windows-hip
-      - ubuntu-22-cpu
-      - ubuntu-22-vulkan
-      - ubuntu-22-cuda
-      - macOS-arm64
-      - macOS-x64
+      #- ubuntu-22-cpu
+      #- ubuntu-22-vulkan
+      #- ubuntu-22-cuda
+      #- macOS-arm64
+      #- macOS-x64
       #- ios-xcode-build
 
     steps:

@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <optional>
 #include <sstream>
+#include <string>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -33,6 +34,7 @@ static void print_usage(int argc, char ** argv, const gpt_params & params) {
     LOG_TEE("\n    %s \\\n"
             "       -m model.gguf -f some-text.txt [-o imatrix.dat] [--process-output] [--verbosity 1] \\\n"
             "       [--no-ppl] [--chunk 123] [--output-frequency 10] [--save-frequency 0] \\\n"
+            "       [--split-on \"### CHAPTER\"] \\\n"
             "       [--in-file imatrix-prev-0.dat --in-file imatrix-prev-1.dat ...]\n" , argv[0]);
     LOG_TEE("\n");
 }
@@ -123,6 +125,27 @@ static std::string filter_tensor_name(const char * name) {
         wname = name;
     }
     return wname;
+}
+
+static std::vector<std::string> split_exact(const std::string & text, const std::string & needle) {
+    if (needle.empty()) {
+        return {text};
+    }
+
+    std::vector<std::string> parts;
+    size_t start = 0;
+
+    while (true) {
+        const size_t pos = text.find(needle, start);
+        if (pos == std::string::npos) {
+            parts.emplace_back(text.substr(start));
+            break;
+        }
+        parts.emplace_back(text.substr(start, pos - start));
+        start = pos + needle.size();
+    }
+
+    return parts;
 }
 
 void IMatrixCollector::print_layer_importance(const char * msg, const std::vector<std::pair<double, int>>& sim) {
@@ -638,27 +661,10 @@ static void process_logits(
     }
 }
 
-static bool compute_imatrix(llama_context * ctx, const gpt_params & params) {
+static bool compute_imatrix_tokens(llama_context * ctx, const gpt_params & params, std::vector<llama_token> tokens) {
     const bool add_bos = llama_should_add_bos_token(llama_get_model(ctx));
     GGML_ASSERT(llama_add_eos_token(llama_get_model(ctx)) != 1);
     const int n_ctx = llama_n_ctx(ctx);
-
-    auto tim1 = std::chrono::high_resolution_clock::now();
-    fprintf(stderr, "%s: tokenizing the input ..\n", __func__);
-
-    std::vector<llama_token> tokens = ::common_tokenize(ctx, params.prompt, true);
-
-    auto tim2 = std::chrono::high_resolution_clock::now();
-    fprintf(stderr, "%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
-
-    if (params.i_chunk > 0) {
-        if (size_t((params.i_chunk + 2)*n_ctx) >= tokens.size()) {
-            fprintf(stderr, "%s: there will be not enough tokens left after removing %d chunks\n", __func__, params.i_chunk);
-            return false;
-        }
-        fprintf(stderr, "%s: removing initial %d chunks (%d tokens)\n", __func__, params.i_chunk, params.i_chunk*n_ctx);
-        tokens.erase(tokens.begin(), tokens.begin() + params.i_chunk*n_ctx);
-    }
 
     if (int(tokens.size()) < 2*n_ctx) {
         fprintf(stderr, "%s: you need at least %d tokens for a context of %d tokens\n",__func__,2*n_ctx,
@@ -778,6 +784,63 @@ static bool compute_imatrix(llama_context * ctx, const gpt_params & params) {
     return true;
 }
 
+static bool compute_imatrix(llama_context * ctx, const gpt_params & params, const std::string & split_on) {
+    const int n_ctx = llama_n_ctx(ctx);
+
+    auto tim1 = std::chrono::high_resolution_clock::now();
+    fprintf(stderr, "%s: tokenizing the input ..\n", __func__);
+
+    if (split_on.empty()) {
+        std::vector<llama_token> tokens = ::common_tokenize(ctx, params.prompt, true);
+
+        auto tim2 = std::chrono::high_resolution_clock::now();
+        fprintf(stderr, "%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
+
+        if (params.i_chunk > 0) {
+            if (size_t((params.i_chunk + 2)*n_ctx) >= tokens.size()) {
+                fprintf(stderr, "%s: there will be not enough tokens left after removing %d chunks\n", __func__, params.i_chunk);
+                return false;
+            }
+            fprintf(stderr, "%s: removing initial %d chunks (%d tokens)\n", __func__, params.i_chunk, params.i_chunk*n_ctx);
+            tokens.erase(tokens.begin(), tokens.begin() + params.i_chunk*n_ctx);
+        }
+
+        return compute_imatrix_tokens(ctx, params, std::move(tokens));
+    }
+
+    const std::vector<std::string> parts = split_exact(params.prompt, split_on);
+
+    auto tim2 = std::chrono::high_resolution_clock::now();
+    fprintf(stderr, "%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
+    fprintf(stderr, "%s: splitting on exact string: '%s'\n", __func__, split_on.c_str());
+
+    bool first_nonempty_part = true;
+
+    for (const auto & part : parts) {
+        std::vector<llama_token> tokens = ::common_tokenize(ctx, part, true);
+        if (tokens.empty()) {
+            continue;
+        }
+
+        if (first_nonempty_part && params.i_chunk > 0) {
+            if (size_t((params.i_chunk + 2)*n_ctx) >= tokens.size()) {
+                fprintf(stderr, "%s: there will be not enough tokens left after removing %d chunks\n", __func__, params.i_chunk);
+                return false;
+            }
+            fprintf(stderr, "%s: removing initial %d chunks (%d tokens)\n", __func__, params.i_chunk, params.i_chunk*n_ctx);
+            tokens.erase(tokens.begin(), tokens.begin() + params.i_chunk*n_ctx);
+        }
+
+        if (!compute_imatrix_tokens(ctx, params, std::move(tokens))) {
+            return false;
+        }
+
+        first_nonempty_part = false;
+    }
+
+    return true;
+}
+
 int main(int argc, char ** argv) {
     gpt_params params;
 
@@ -786,6 +849,7 @@ int main(int argc, char ** argv) {
     params.verbosity = 1;
 
     bool lsim = false;
+    std::string split_on;
     //
     // Do not pollute common with totally imatrix specific arguments as it was done in mainline.
     // Instead, parse imatrix specific args here, push unknown args into a new array of args,
@@ -798,6 +862,10 @@ int main(int argc, char ** argv) {
         std::string arg{argv[i]};
         if (arg == "-lsim" || arg == "--layer-similarity") {
             lsim = true;
+        } else if (arg == "--split-on" && i + 1 < argc) {
+            split_on = argv[++i];
+        } else if (arg.rfind("--split-on=", 0) == 0) {
+            split_on = arg.substr(strlen("--split-on="));
         } else {
             args.push_back(argv[i]);
         }
@@ -857,7 +925,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s\n", gpt_params_get_system_info(params).c_str());
     }
 
-    if (!compute_imatrix(ctx, params)) {
+    if (!compute_imatrix(ctx, params, split_on)) {
         return 1;
     }
 
