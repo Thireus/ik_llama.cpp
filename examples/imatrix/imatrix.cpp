@@ -34,7 +34,7 @@ static void print_usage(int argc, char ** argv, const gpt_params & params) {
     LOG_TEE("\n    %s \\\n"
             "       -m model.gguf -f some-text.txt [-o imatrix.dat] [--process-output] [--verbosity 1] \\\n"
             "       [--no-ppl] [--chunk 123] [--output-frequency 10] [--save-frequency 0] \\\n"
-            "       [--split-on \"### CHAPTER\"] \\\n"
+            "       [--split-on \"### CHAPTER\"] [--verbose-chunks] \\\n"
             "       [--in-file imatrix-prev-0.dat --in-file imatrix-prev-1.dat ...]\n" , argv[0]);
     LOG_TEE("\n");
 }
@@ -46,6 +46,30 @@ struct Stats {
     int n_as = 1;
 };
 
+struct ppl_stats {
+    double nll  = 0.0;
+    double nll2 = 0.0;
+    int    count = 0;
+};
+
+static void print_final_ppl(const ppl_stats & stats) {
+    if (stats.count <= 0) {
+        return;
+    }
+
+    const double mean_nll  = stats.nll / stats.count;
+    double mean_nll2 = stats.nll2 / stats.count;
+    const double ppl = exp(mean_nll);
+
+    mean_nll2 -= mean_nll * mean_nll;
+    if (mean_nll2 > 0 && stats.count > 1) {
+        mean_nll2 = sqrt(mean_nll2 / (stats.count - 1));
+        printf("Final estimate: PPL = %.4lf +/- %.5lf\n", ppl, mean_nll2 * ppl);
+    } else {
+        printf("Final estimate: PPL = %.4lf\n", ppl);
+    }
+}
+
 class IMatrixCollector {
 public:
     IMatrixCollector() = default;
@@ -54,6 +78,7 @@ public:
     void save_imatrix(int ncall = -1) const;
     bool load_imatrix(const char * file_name);
     void set_collect_lsim(bool yes_or_no) { m_collect_lsim = yes_or_no; }
+    void reset_lsim_state();
     void print_layer_importance();
 private:
     std::unordered_map<std::string, Stats> m_stats;
@@ -146,6 +171,24 @@ static std::vector<std::string> split_exact(const std::string & text, const std:
     }
 
     return parts;
+}
+
+static void print_chunk_stdout(size_t chunk_idx, size_t chunk_total, const std::string & chunk) {
+    std::fprintf(stdout, "\n===== chunk %zu/%zu =====\n", chunk_idx + 1, chunk_total);
+    std::fwrite(chunk.data(), 1, chunk.size(), stdout);
+    if (chunk.empty() || chunk.back() != '\n') {
+        std::fputc('\n', stdout);
+    }
+    std::fprintf(stdout, "===== end chunk %zu/%zu =====\n", chunk_idx + 1, chunk_total);
+    std::fflush(stdout);
+}
+
+void IMatrixCollector::reset_lsim_state() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_last_layer = 9999;
+    m_last_ffn = -1;
+    m_last_input.clear();
+    m_ffn_input.clear();
 }
 
 void IMatrixCollector::print_layer_importance(const char * msg, const std::vector<std::pair<double, int>>& sim) {
@@ -588,7 +631,6 @@ static bool ik_collect_imatrix(struct ggml_tensor * t, bool ask, void * user_dat
     return g_collector.collect_imatrix(t, ask, user_data);
 }
 
-
 struct results_log_softmax {
     double log_softmax;
     float  logit;
@@ -661,17 +703,30 @@ static void process_logits(
     }
 }
 
-static bool compute_imatrix_tokens(llama_context * ctx, const gpt_params & params, std::vector<llama_token> tokens) {
+static bool compute_imatrix_tokens(
+        llama_context * ctx,
+        const gpt_params & params,
+        std::vector<llama_token> tokens,
+        ppl_stats * ppl_accum,
+        bool print_ppl_progress,
+        bool print_ppl_final) {
     const bool add_bos = llama_should_add_bos_token(llama_get_model(ctx));
     GGML_ASSERT(llama_add_eos_token(llama_get_model(ctx)) != 1);
-    const int n_ctx = llama_n_ctx(ctx);
 
-    if (int(tokens.size()) < 2*n_ctx) {
-        fprintf(stderr, "%s: you need at least %d tokens for a context of %d tokens\n",__func__,2*n_ctx,
-                n_ctx);
-        fprintf(stderr, "%s: the data file you provided tokenizes to only %zu tokens\n",__func__,tokens.size());
-        return false;
+    const int max_ctx = llama_n_ctx(ctx);
+    const int n_tokens = (int)tokens.size();
+
+    if (n_tokens < 2) {
+        fprintf(stderr, "%s: chunk too short (%d tokens), skipping\n", __func__, n_tokens);
+        return true;
     }
+
+    if (n_tokens > max_ctx) {
+        fprintf(stderr, "%s: chunk has %d tokens, truncating to context limit %d\n", __func__, n_tokens, max_ctx);
+        tokens.resize(max_ctx);
+    }
+
+    const int n_eval_tokens = (int)tokens.size();
 
     std::vector<float> logit_history;
     std::vector<float> prob_history;
@@ -681,32 +736,31 @@ static bool compute_imatrix_tokens(llama_context * ctx, const gpt_params & param
         prob_history.resize(tokens.size());
     }
 
-    const int n_chunk_max = tokens.size() / n_ctx;
-
-    const int n_chunk = params.n_chunks < 0 ? n_chunk_max : std::min(params.n_chunks, n_chunk_max);
     const int n_vocab = llama_n_vocab(llama_get_model(ctx));
     const int n_batch = params.n_batch;
+    const int total_windows = (n_eval_tokens + max_ctx - 1) / max_ctx;
 
     int count = 0;
     double nll = 0.0;
     double nll2 = 0.0;
 
-    fprintf(stderr, "%s: computing over %d chunks with batch_size %d\n", __func__, n_chunk, n_batch);
+    fprintf(stderr, "%s: processing segment with %d token(s), batch_size %d\n",
+            __func__, n_eval_tokens, n_batch);
 
-    std::vector<std::thread> workers(std::thread::hardware_concurrency() - 1);
-
-    const int num_batches = (n_ctx + n_batch - 1) / n_batch;
-
-    std::vector<float> logits;
-    if (params.compute_ppl && num_batches > 1) {
-        logits.reserve((size_t)n_ctx * n_vocab);
+    size_t worker_count = std::thread::hardware_concurrency();
+    if (worker_count > 0) {
+        --worker_count;
     }
+    std::vector<std::thread> workers(worker_count);
 
-    for (int i = 0; i < n_chunk; ++i) {
-        const int start =     i * n_ctx;
-        const int end   = start + n_ctx;
+    for (int window = 0, offset = 0; offset < n_eval_tokens; ++window, offset += max_ctx) {
+        const int ctx_len = std::min(max_ctx, n_eval_tokens - offset);
+        const int num_batches = (ctx_len + n_batch - 1) / n_batch;
 
         std::vector<float> logits;
+        if (params.compute_ppl && num_batches > 1) {
+            logits.reserve((size_t)ctx_len * n_vocab);
+        }
 
         const auto t_start = std::chrono::high_resolution_clock::now();
 
@@ -714,8 +768,12 @@ static bool compute_imatrix_tokens(llama_context * ctx, const gpt_params & param
         llama_kv_cache_clear(ctx);
 
         for (int j = 0; j < num_batches; ++j) {
-            const int batch_start = start + j * n_batch;
-            const int batch_size  = std::min(end - batch_start, n_batch);
+            const int batch_start = offset + j * n_batch;
+            const int batch_size  = std::min(ctx_len - j * n_batch, n_batch);
+
+            if (batch_size <= 0) {
+                break;
+            }
 
             // save original token and restore it after eval
             const auto token_org = tokens[batch_start];
@@ -742,10 +800,10 @@ static bool compute_imatrix_tokens(llama_context * ctx, const gpt_params & param
 
         const auto t_end = std::chrono::high_resolution_clock::now();
 
-        if (i == 0) {
+        if (window == 0) {
             const float t_total = std::chrono::duration<float>(t_end - t_start).count();
             fprintf(stderr, "%s: %.2f seconds per pass - ETA ", __func__, t_total);
-            int total_seconds = (int)(t_total * n_chunk);
+            int total_seconds = (int)(t_total * total_windows);
             if (total_seconds >= 60*60) {
                 fprintf(stderr, "%d hours ", total_seconds / (60*60));
                 total_seconds = total_seconds % (60*60);
@@ -754,49 +812,62 @@ static bool compute_imatrix_tokens(llama_context * ctx, const gpt_params & param
         }
 
         if (params.compute_ppl) {
-            const int first = n_ctx/2;
-            const auto all_logits = num_batches > 1 ? logits.data() : llama_get_logits(ctx);
-            process_logits(n_vocab, all_logits + first*n_vocab, tokens.data() + start + first, n_ctx - 1 - first,
-                    workers, nll, nll2, logit_history.data() + start + first, prob_history.data() + start + first);
-            count += n_ctx - first - 1;
+            const int first = ctx_len/2;
+            if (ctx_len - 1 - first > 0) {
+                const auto all_logits = num_batches > 1 ? logits.data() : llama_get_logits(ctx);
+                process_logits(
+                        n_vocab, all_logits + first*n_vocab, tokens.data() + offset + first, ctx_len - 1 - first,
+                        workers, nll, nll2, logit_history.data() + offset + first, prob_history.data() + offset + first);
+                count += ctx_len - first - 1;
 
-            printf("[%d]%.4lf,", i + 1, std::exp(nll / count));
-            fflush(stdout);
-
-            logits.clear();
+                if (print_ppl_progress) {
+                    printf("[%d/%d]%.4lf,", window + 1, total_windows, std::exp(nll / count));
+                    fflush(stdout);
+                }
+            }
         }
     }
-    printf("\n");
 
     if (params.compute_ppl) {
-        nll2 /= count;
-        nll /= count;
-        const double ppl = exp(nll);
-        nll2 -= nll * nll;
-        if (nll2 > 0) {
-            nll2 = sqrt(nll2/(count-1));
-            printf("Final estimate: PPL = %.4lf +/- %.5lf\n", ppl, nll2*ppl);
-        } else {
-            printf("Unexpected negative standard deviation of log(prob)\n");
+        printf("\n");
+    }
+
+    if (params.compute_ppl && ppl_accum != nullptr) {
+        ppl_accum->nll  += nll;
+        ppl_accum->nll2 += nll2;
+        ppl_accum->count += count;
+    }
+
+    if (params.compute_ppl && print_ppl_final) {
+        if (count > 0) {
+            nll2 /= count;
+            nll /= count;
+            const double ppl = exp(nll);
+            nll2 -= nll * nll;
+            if (nll2 > 0) {
+                nll2 = sqrt(nll2/(count-1));
+                printf("Final estimate: PPL = %.4lf +/- %.5lf\n", ppl, nll2*ppl);
+            } else {
+                printf("Unexpected negative standard deviation of log(prob)\n");
+            }
         }
     }
 
     return true;
 }
 
-static bool compute_imatrix(llama_context * ctx, const gpt_params & params, const std::string & split_on) {
-    const int n_ctx = llama_n_ctx(ctx);
-
-    auto tim1 = std::chrono::high_resolution_clock::now();
-    fprintf(stderr, "%s: tokenizing the input ..\n", __func__);
-
+static bool compute_imatrix(llama_context * ctx, const gpt_params & params, const std::string & split_on, bool verbose_chunks) {
     if (split_on.empty()) {
+        auto tim1 = std::chrono::high_resolution_clock::now();
+        fprintf(stderr, "%s: tokenizing the input ..\n", __func__);
+
         std::vector<llama_token> tokens = ::common_tokenize(ctx, params.prompt, true);
 
         auto tim2 = std::chrono::high_resolution_clock::now();
         fprintf(stderr, "%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
 
         if (params.i_chunk > 0) {
+            const int n_ctx = llama_n_ctx(ctx);
             if (size_t((params.i_chunk + 2)*n_ctx) >= tokens.size()) {
                 fprintf(stderr, "%s: there will be not enough tokens left after removing %d chunks\n", __func__, params.i_chunk);
                 return false;
@@ -805,37 +876,98 @@ static bool compute_imatrix(llama_context * ctx, const gpt_params & params, cons
             tokens.erase(tokens.begin(), tokens.begin() + params.i_chunk*n_ctx);
         }
 
-        return compute_imatrix_tokens(ctx, params, std::move(tokens));
+        return compute_imatrix_tokens(ctx, params, std::move(tokens), nullptr, true, true);
     }
 
-    const std::vector<std::string> parts = split_exact(params.prompt, split_on);
-
-    auto tim2 = std::chrono::high_resolution_clock::now();
-    fprintf(stderr, "%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
+    auto tim1 = std::chrono::high_resolution_clock::now();
     fprintf(stderr, "%s: splitting on exact string: '%s'\n", __func__, split_on.c_str());
 
-    bool first_nonempty_part = true;
+    std::vector<std::string> raw_parts = split_exact(params.prompt, split_on);
+    std::vector<std::string> chunks;
+    chunks.reserve(raw_parts.size());
+    for (const auto & part : raw_parts) {
+        if (!part.empty()) {
+            chunks.push_back(part);
+        }
+    }
 
-    for (const auto & part : parts) {
-        std::vector<llama_token> tokens = ::common_tokenize(ctx, part, true);
-        if (tokens.empty()) {
-            continue;
+    auto tim2 = std::chrono::high_resolution_clock::now();
+    fprintf(stderr, "%s: split into %zu non-empty chunk(s) in %g ms\n",
+            __func__, chunks.size(), 1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2 - tim1).count());
+
+    if (params.i_chunk > 0) {
+        if ((size_t)params.i_chunk >= chunks.size()) {
+            fprintf(stderr, "%s: there will be not enough chunks left after removing %d chunks\n", __func__, params.i_chunk);
+            return false;
+        }
+        fprintf(stderr, "%s: removing initial %d chunk(s)\n", __func__, params.i_chunk);
+        chunks.erase(chunks.begin(), chunks.begin() + params.i_chunk);
+    }
+
+    fprintf(stderr, "%s: %zu chunk(s) will be processed\n", __func__, chunks.size());
+
+    struct chunk_tokens_info {
+        std::string chunk;
+        std::vector<llama_token> tokens;
+    };
+
+    std::vector<chunk_tokens_info> tokenized_chunks;
+    tokenized_chunks.reserve(chunks.size());
+
+    auto token_start = std::chrono::high_resolution_clock::now();
+    for (const auto & chunk : chunks) {
+        tokenized_chunks.push_back({chunk, ::common_tokenize(ctx, chunk, true)});
+    }
+    auto token_end = std::chrono::high_resolution_clock::now();
+
+    fprintf(stderr, "%s: tokenization of %zu chunk(s) took %g ms\n",
+            __func__, tokenized_chunks.size(),
+            1e-3*std::chrono::duration_cast<std::chrono::microseconds>(token_end - token_start).count());
+
+    const int n_ctx = llama_n_ctx(ctx);
+    fprintf(stderr, "%s: chunk token sizes:\n", __func__);
+    for (size_t i = 0; i < tokenized_chunks.size(); ++i) {
+        const size_t n_tok = tokenized_chunks[i].tokens.size();
+        if (n_tok > (size_t)n_ctx) {
+            fprintf(stderr, "%s:   chunk %zu -> %zu token(s), will be truncated to %d\n",
+                    __func__, i + 1, n_tok, n_ctx);
+        } else if (n_tok < (size_t)n_ctx) {
+            fprintf(stderr, "%s:   chunk %zu -> %zu token(s), using chunk length (< ctx %d)\n",
+                    __func__, i + 1, n_tok, n_ctx);
+        } else {
+            fprintf(stderr, "%s:   chunk %zu -> %zu token(s), exactly at ctx limit\n",
+                    __func__, i + 1, n_tok);
+        }
+    }
+
+    ppl_stats total_ppl;
+
+    for (size_t i = 0; i < tokenized_chunks.size(); ++i) {
+        if (verbose_chunks) {
+            print_chunk_stdout(i, tokenized_chunks.size(), tokenized_chunks[i].chunk);
         }
 
-        if (first_nonempty_part && params.i_chunk > 0) {
-            if (size_t((params.i_chunk + 2)*n_ctx) >= tokens.size()) {
-                fprintf(stderr, "%s: there will be not enough tokens left after removing %d chunks\n", __func__, params.i_chunk);
-                return false;
-            }
-            fprintf(stderr, "%s: removing initial %d chunks (%d tokens)\n", __func__, params.i_chunk, params.i_chunk*n_ctx);
-            tokens.erase(tokens.begin(), tokens.begin() + params.i_chunk*n_ctx);
-        }
+        g_collector.reset_lsim_state();
 
-        if (!compute_imatrix_tokens(ctx, params, std::move(tokens))) {
+        if (!compute_imatrix_tokens(
+                    ctx,
+                    params,
+                    std::move(tokenized_chunks[i].tokens),
+                    params.compute_ppl ? &total_ppl : nullptr,
+                    false,
+                    false)) {
             return false;
         }
 
-        first_nonempty_part = false;
+        if (params.compute_ppl && total_ppl.count > 0) {
+            printf("[%zu/%zu]%.4lf,", i + 1, tokenized_chunks.size(), std::exp(total_ppl.nll / total_ppl.count));
+            fflush(stdout);
+        }
+    }
+
+    if (params.compute_ppl) {
+        printf("\n");
+        print_final_ppl(total_ppl);
     }
 
     return true;
@@ -849,6 +981,7 @@ int main(int argc, char ** argv) {
     params.verbosity = 1;
 
     bool lsim = false;
+    bool verbose_chunks = false;
     std::string split_on;
     //
     // Do not pollute common with totally imatrix specific arguments as it was done in mainline.
@@ -862,6 +995,8 @@ int main(int argc, char ** argv) {
         std::string arg{argv[i]};
         if (arg == "-lsim" || arg == "--layer-similarity") {
             lsim = true;
+        } else if (arg == "--verbose-chunks") {
+            verbose_chunks = true;
         } else if (arg == "--split-on" && i + 1 < argc) {
             split_on = argv[++i];
         } else if (arg.rfind("--split-on=", 0) == 0) {
@@ -925,7 +1060,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s\n", gpt_params_get_system_info(params).c_str());
     }
 
-    if (!compute_imatrix(ctx, params, split_on)) {
+    if (!compute_imatrix(ctx, params, split_on, verbose_chunks)) {
         return 1;
     }
 
