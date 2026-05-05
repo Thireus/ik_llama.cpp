@@ -22,7 +22,7 @@ env:
 
 jobs:
   macOS-arm64:
-    #if: false
+    if: false
     runs-on: macos-14
 
     steps:
@@ -59,7 +59,7 @@ jobs:
             -DGGML_RPC=OFF \
             -DGGML_MAX_CONTEXTS=2048 \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
+          cmake --build build --config Release --target llama-perplexity -j $(sysctl -n hw.logicalcpu)
 
       - name: Determine tag name
         id: tag
@@ -79,7 +79,7 @@ jobs:
           name: llama-${{ steps.tag.outputs.name }}-bin-macos-arm64.zip
 
   macOS-x64:
-    #if: false
+    if: false
     runs-on: macos-15-intel
 
     strategy:
@@ -130,7 +130,7 @@ jobs:
             -DGGML_MAX_CONTEXTS=2048 \
             -DGGML_METAL_NDEBUG=ON \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
+          cmake --build build --config Release --target llama-perplexity -j $(sysctl -n hw.logicalcpu)
 
       - name: Determine tag name
         id: tag
@@ -150,7 +150,7 @@ jobs:
           name: llama-${{ steps.tag.outputs.name }}-bin-macos-x64-${{ matrix.instr }}.zip
 
   ubuntu-22-cpu:
-    #if: false
+    if: false
     strategy:
       matrix:
         instr: ['avx2', 'avx512', 'avx512_vnni', 'avx512_vnni_bf16', 'avx512_vnni_vbmi', 'avx512_vnni_vbmi_bf16'] # 'avx', 'noavx' won't compile because missing declarations all over the place
@@ -199,7 +199,7 @@ jobs:
             -DCURL_LIBRARY="%CURL_PATH%/lib/libcurl.dll.a" -DCURL_INCLUDE_DIR="%CURL_PATH%/include" \
             -DGGML_MAX_CONTEXTS=2048 \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(nproc)
+          cmake --build build --config Release --target llama-perplexity -j $(nproc)
 
       - name: Determine tag name
         id: tag
@@ -252,7 +252,7 @@ jobs:
           name: llama-${{ steps.tag.outputs.name }}-bin-ubuntu-${{ matrix.build }}-${{ matrix.instr }}.zip
 
   ubuntu-22-vulkan:
-    #if: false
+    if: false
     strategy:
       matrix:
         instr: ['avx2', 'avx512', 'avx512_vnni', 'avx512_vnni_bf16', 'avx512_vnni_vbmi', 'avx512_vnni_vbmi_bf16'] # 'avx', 'noavx' won't compile because missing declarations all over the place
@@ -306,7 +306,7 @@ jobs:
             -DGGML_SCHED_MAX_COPIES=1 \
             -DGGML_MAX_CONTEXTS=2048 \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(nproc)
+          cmake --build build --config Release --target llama-perplexity -j $(nproc)
 
       - name: Determine tag name
         id: tag
@@ -359,7 +359,7 @@ jobs:
           name: llama-${{ steps.tag.outputs.name }}-bin-ubuntu-vulkan-${{ matrix.build }}-${{ matrix.instr }}.zip
 
   ubuntu-22-cuda:
-    #if: false
+    if: false
     strategy:
       matrix:
         cuda: ['12.8', '13.1'] # '11.7',
@@ -416,7 +416,7 @@ jobs:
             -DGGML_MAX_CONTEXTS=2048 \
             -DGGML_CUDA_USE_GRAPHS=ON \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(nproc)
+          cmake --build build --config Release --target llama-perplexity -j $(nproc)
 
       - name: Determine tag name
         id: tag
@@ -484,7 +484,7 @@ jobs:
           name: cudart-llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-${{ matrix.cuda }}-${{ matrix.build }}-${{ matrix.instr }}.zip
 
   windows-cpu:
-    #if: false # Not ready yet
+    if: false # Not ready yet
     runs-on: windows-2022
 
     strategy:
@@ -610,7 +610,7 @@ jobs:
           name: llama-${{ steps.tag.outputs.name }}-bin-win-cpu-${{ matrix.arch }}-${{ matrix.instr }}.zip
 
   windows-cpu-clang:
-    #if: false # Not ready yet
+    if: false # Not ready yet
     runs-on: windows-2022
 
     strategy:
@@ -998,7 +998,7 @@ jobs:
         id: cmake_build
         run: |
           cmake -S . -B build ${{ matrix.defines }} -DGGML_NATIVE=OFF -DLLAMA_CURL=OFF -DGGML_MAX_CONTEXTS=2048
-          cmake --build build --config Release --target ${{ matrix.target }}
+          cmake --build build --config Release --target llama-perplexity --target ${{ matrix.target }}
 
       - name: Determine tag name
         id: tag
@@ -1134,7 +1134,7 @@ jobs:
             ${{ env.CMAKE_ARGS }}
 
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
-          cmake --build build --config Release -j %NINJA_JOBS%
+          cmake --build build --config Release --target llama-perplexity --target llama-perplexity -j %NINJA_JOBS%
 
       - name: Determine tag name
         id: tag
@@ -1207,7 +1207,7 @@ jobs:
           name: cudart-llama-${{ steps.tag.outputs.name }}-bin-win-cuda-${{ matrix.cuda }}-x64-${{ matrix.instr }}.zip
 
   windows-cuda-clang:
-    #if: false
+    if: false
     runs-on: windows-2022
 
     strategy:
@@ -1522,7 +1522,7 @@ jobs:
             ${{ env.CMAKE_ARGS }}
 
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
-          cmake --build build --config Release -j %NINJA_JOBS%
+          cmake --build build --config Release --target llama-perplexity -j %NINJA_JOBS%
 
       - name: Determine tag name
         id: tag
@@ -1772,7 +1772,7 @@ jobs:
             -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
             -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=ggml \
             -DGGML_MAX_CONTEXTS=2048
-          cmake --build build --config Release -j $(sysctl -n hw.logicalcpu) -- CODE_SIGNING_ALLOWED=NO
+          cmake --build build --config Release --target llama-perplexity -j $(sysctl -n hw.logicalcpu) -- CODE_SIGNING_ALLOWED=NO
 
       - name: xcodebuild for swift package
         id: xcodebuild
@@ -1809,17 +1809,17 @@ jobs:
 
     needs:
       #- windows
-      - windows-cpu
-      - windows-cpu-clang
+      #- windows-cpu
+      #- windows-cpu-clang
       - windows-cuda
-      - windows-cuda-clang
+      #- windows-cuda-clang
       #- windows-sycl
       #- windows-hip
-      - ubuntu-22-cpu
-      - ubuntu-22-vulkan
-      - ubuntu-22-cuda
-      - macOS-arm64
-      - macOS-x64
+      #- ubuntu-22-cpu
+      #- ubuntu-22-vulkan
+      #- ubuntu-22-cuda
+      #- macOS-arm64
+      #- macOS-x64
       #- ios-xcode-build
 
     steps:
