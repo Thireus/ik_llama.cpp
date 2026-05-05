@@ -2173,7 +2173,7 @@ int main(int argc, char ** argv) {
     params.n_ctx = 512;
     params.logits_all = true;
 
-    if (!gpt_params_parse(args.size(), args.data(), params)) {
+    if (!gpt_params_parse(argc, argv, params)) {
         gpt_params_print_usage(argc, argv, params);
         return 1;
     }
@@ -2190,19 +2190,14 @@ int main(int argc, char ** argv) {
     bool verbose_chunks = false;
     std::string split_on;
 
-    std::vector<char*> args;
-    args.reserve(argc);
-    args.push_back(argv[0]);
+    // extract custom arguments before common parsing
     for (int i = 1; i < argc; ++i) {
-        std::string arg{argv[i]};
-        if (arg == "--verbose-chunks") {
+        if (strcmp(argv[i], "--verbose-chunks") == 0) {
             verbose_chunks = true;
-        } else if (arg == "--split-on" && i + 1 < argc) {
+        } else if (strcmp(argv[i], "--split-on") == 0 && i + 1 < argc) {
             split_on = argv[++i];
-        } else if (arg.rfind("--split-on=", 0) == 0) {
-            split_on = arg.substr(strlen("--split-on="));
-        } else {
-            args.push_back(argv[i]);
+        } else if (strncmp(argv[i], "--split-on=", 11) == 0) {
+            split_on = argv[i] + 11;
         }
     }
 
@@ -2281,7 +2276,7 @@ int main(int argc, char ** argv) {
         multiple_choice_score(ctx, params);
     } else if (params.kl_divergence) {
         kl_divergence(ctx, params);
-        } else {
+    } else {
         if (!split_on.empty()) {
             if (!params.logits_file.empty()) {
                 fprintf(stderr, "%s: warning: --logits-file is not supported with --split-on, ignoring file.\n", __func__);
