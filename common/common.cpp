@@ -2321,6 +2321,15 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.i_chunk = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "--split-on") {
+        CHECK_ARG
+        params.split_on = argv[i];
+        return true;
+    }
+    if (arg == "--verbose-chunks") {
+        params.verbose_chunks = true;
+        return true;
+    }
     // cvector params
     if (arg == "--positive-file") {
         CHECK_ARG

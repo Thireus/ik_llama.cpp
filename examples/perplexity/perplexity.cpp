@@ -2187,20 +2187,6 @@ int main(int argc, char ** argv) {
 
     const bool ppl = !params.hellaswag && !params.winogrande && !params.multiple_choice && !params.kl_divergence;
 
-    bool verbose_chunks = false;
-    std::string split_on;
-
-    // extract custom arguments before common parsing
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--verbose-chunks") == 0) {
-            verbose_chunks = true;
-        } else if (strcmp(argv[i], "--split-on") == 0 && i + 1 < argc) {
-            split_on = argv[++i];
-        } else if (strncmp(argv[i], "--split-on=", 11) == 0) {
-            split_on = argv[i] + 11;
-        }
-    }
-
     if (ppl) {
         const int32_t n_seq = std::max(1, params.n_batch / n_ctx);
         const int32_t n_kv = n_seq * n_ctx;
