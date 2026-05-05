@@ -20,7 +20,6 @@
 #include <array>
 #include <fstream>
 #include <sstream>
-#include <string>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -38,262 +37,6 @@ struct results_log_softmax {
     float  logit;
     float  prob;
 };
-
-struct ppl_stats {
-    double nll  = 0.0;
-    double nll2 = 0.0;
-    int    count = 0;
-};
-
-static void print_final_ppl(const ppl_stats & stats) {
-    if (stats.count <= 0) {
-        return;
-    }
-
-    const double mean_nll  = stats.nll / stats.count;
-    double mean_nll2 = stats.nll2 / stats.count;
-    const double ppl = exp(mean_nll);
-
-    mean_nll2 -= mean_nll * mean_nll;
-    if (mean_nll2 > 0 && stats.count > 1) {
-        mean_nll2 = sqrt(mean_nll2 / (stats.count - 1));
-        printf("Final estimate: PPL = %.4lf +/- %.5lf\n", ppl, mean_nll2 * ppl);
-    } else {
-        printf("Final estimate: PPL = %.4lf\n", ppl);
-    }
-}
-
-static std::vector<std::string> split_exact(const std::string & text, const std::string & needle) {
-    if (needle.empty()) {
-        return {text};
-    }
-
-    std::vector<std::string> parts;
-    size_t start = 0;
-
-    while (true) {
-        const size_t pos = text.find(needle, start);
-        if (pos == std::string::npos) {
-            parts.emplace_back(text.substr(start));
-            break;
-        }
-        parts.emplace_back(text.substr(start, pos - start));
-        start = pos + needle.size();
-    }
-
-    return parts;
-}
-
-static void print_chunk_stdout(size_t chunk_idx, size_t chunk_total, const std::string & chunk) {
-    std::fprintf(stdout, "\n===== chunk %zu/%zu =====\n", chunk_idx + 1, chunk_total);
-    std::fwrite(chunk.data(), 1, chunk.size(), stdout);
-    if (chunk.empty() || chunk.back() != '\n') {
-        std::fputc('\n', stdout);
-    }
-    std::fprintf(stdout, "===== end chunk %zu/%zu =====\n", chunk_idx + 1, chunk_total);
-    std::fflush(stdout);
-}
-
-static bool evaluate_perplexity_tokens(
-        llama_context * ctx,
-        const gpt_params & params,
-        std::vector<llama_token> & tokens,
-        double & nll,
-        double & nll2,
-        int & count,
-        std::vector<float> * logit_history,
-        std::vector<float> * prob_history) {
-    const bool add_bos = llama_should_add_bos_token(llama_get_model(ctx));
-    GGML_ASSERT(llama_add_eos_token(llama_get_model(ctx)) != 1);
-
-    const int n_ctx = llama_n_ctx(ctx);
-
-    if ((int) tokens.size() > n_ctx) {
-        fprintf(stderr, "%s: chunk has %zu tokens, truncating to context limit %d\n",
-                __func__, tokens.size(), n_ctx);
-        tokens.resize(n_ctx);
-    }
-
-    const int n_tokens = (int) tokens.size();
-    if (n_tokens < 2) {
-        fprintf(stderr, "%s: chunk too short (%d tokens), skipping\n", __func__, n_tokens);
-        return true;
-    }
-
-    const int n_vocab = llama_n_vocab(llama_get_model(ctx));
-    const int n_batch  = params.n_batch;
-    const int num_batches = (n_tokens + n_batch - 1) / n_batch;
-    const int first = n_tokens / 2;
-
-    std::vector<float> local_logit_history(n_tokens, 0.f);
-    std::vector<float> local_prob_history(n_tokens, 0.f);
-
-    size_t worker_count = std::thread::hardware_concurrency();
-    if (worker_count > 0) {
-        --worker_count;
-    }
-    std::vector<std::thread> workers(worker_count);
-
-    std::vector<float> logits;
-    if (num_batches > 1) {
-        logits.reserve((size_t) n_tokens * n_vocab);
-    }
-
-    llama_kv_cache_clear(ctx);
-
-    for (int j = 0; j < num_batches; ++j) {
-        const int batch_start = j * n_batch;
-        const int batch_size  = std::min(n_tokens - batch_start, n_batch);
-
-        if (batch_size <= 0) {
-            break;
-        }
-
-        const auto token_org = tokens[batch_start];
-
-        if (add_bos && j == 0) {
-            tokens[batch_start] = llama_token_bos(llama_get_model(ctx));
-        }
-
-        if (llama_decode(ctx, llama_batch_get_one(tokens.data() + batch_start, batch_size, j * n_batch, 0))) {
-            fprintf(stderr, "%s : failed to eval\n", __func__);
-            return false;
-        }
-
-        tokens[batch_start] = token_org;
-
-        if (num_batches > 1) {
-            const auto * batch_logits = llama_get_logits(ctx);
-            logits.insert(logits.end(), batch_logits, batch_logits + batch_size * n_vocab);
-        }
-    }
-
-    if (n_tokens - 1 - first > 0) {
-        const auto * all_logits = num_batches > 1 ? logits.data() : llama_get_logits(ctx);
-        process_logits(
-                n_vocab,
-                all_logits + first * n_vocab,
-                tokens.data() + first,
-                n_tokens - 1 - first,
-                workers,
-                nll,
-                nll2,
-                local_logit_history.data() + first,
-                local_prob_history.data() + first);
-        count += n_tokens - first - 1;
-    }
-
-    if (logit_history != nullptr) {
-        logit_history->insert(
-                logit_history->end(),
-                local_logit_history.begin(),
-                local_logit_history.end());
-    }
-
-    if (prob_history != nullptr) {
-        prob_history->insert(
-                prob_history->end(),
-                local_prob_history.begin(),
-                local_prob_history.end());
-    }
-
-    return true;
-}
-
-static results_perplexity perplexity_split(llama_context * ctx, const gpt_params & params, const std::string & split_on, bool verbose_chunks) {
-    results_perplexity results;
-
-    auto tim1 = std::chrono::high_resolution_clock::now();
-    fprintf(stderr, "%s: splitting on exact string: '%s'\n", __func__, split_on.c_str());
-
-    std::vector<std::string> raw_parts = split_exact(params.prompt, split_on);
-    std::vector<std::string> chunks;
-    chunks.reserve(raw_parts.size());
-    for (const auto & part : raw_parts) {
-        if (!part.empty()) {
-            chunks.push_back(part);
-        }
-    }
-
-    auto tim2 = std::chrono::high_resolution_clock::now();
-    fprintf(stderr, "%s: split into %zu non-empty chunk(s) in %g ms\n",
-            __func__, chunks.size(), 1e-3 * std::chrono::duration_cast<std::chrono::microseconds>(tim2 - tim1).count());
-
-    if (chunks.empty()) {
-        fprintf(stderr, "%s: no non-empty chunks\n", __func__);
-        return results;
-    }
-
-    struct chunk_tokens_info {
-        std::string chunk;
-        std::vector<llama_token> tokens;
-    };
-
-    std::vector<chunk_tokens_info> tokenized_chunks;
-    tokenized_chunks.reserve(chunks.size());
-
-    auto token_start = std::chrono::high_resolution_clock::now();
-    for (const auto & chunk : chunks) {
-        tokenized_chunks.push_back({chunk, ::common_tokenize(ctx, chunk, true)});
-    }
-    auto token_end = std::chrono::high_resolution_clock::now();
-
-    fprintf(stderr, "%s: tokenization of %zu chunk(s) took %g ms\n",
-            __func__, tokenized_chunks.size(),
-            1e-3 * std::chrono::duration_cast<std::chrono::microseconds>(token_end - token_start).count());
-
-    const int n_ctx = llama_n_ctx(ctx);
-    fprintf(stderr, "%s: chunk token sizes:\n", __func__);
-    for (size_t i = 0; i < tokenized_chunks.size(); ++i) {
-        const size_t n_tok = tokenized_chunks[i].tokens.size();
-        if (n_tok > (size_t) n_ctx) {
-            fprintf(stderr, "%s:   chunk %zu -> %zu token(s), will be truncated to %d\n",
-                    __func__, i + 1, n_tok, n_ctx);
-        } else if (n_tok < (size_t) n_ctx) {
-            fprintf(stderr, "%s:   chunk %zu -> %zu token(s), using chunk length (< ctx %d)\n",
-                    __func__, i + 1, n_tok, n_ctx);
-        } else {
-            fprintf(stderr, "%s:   chunk %zu -> %zu token(s), exactly at ctx limit\n",
-                    __func__, i + 1, n_tok);
-        }
-    }
-
-    ppl_stats total_ppl;
-
-    for (size_t i = 0; i < tokenized_chunks.size(); ++i) {
-        if (verbose_chunks) {
-            print_chunk_stdout(i, tokenized_chunks.size(), tokenized_chunks[i].chunk);
-        }
-
-        auto & tokens = tokenized_chunks[i].tokens;
-
-        if (!evaluate_perplexity_tokens(
-                    ctx,
-                    params,
-                    tokens,
-                    total_ppl.nll,
-                    total_ppl.nll2,
-                    total_ppl.count,
-                    &results.logits,
-                    &results.probs)) {
-            results.ppl_value = -1.0;
-            return results;
-        }
-
-        results.tokens.insert(results.tokens.end(), tokens.begin(), tokens.end());
-
-        if (total_ppl.count > 0) {
-            printf("[%zu/%zu]%.4lf,", i + 1, tokenized_chunks.size(), std::exp(total_ppl.nll / total_ppl.count));
-            fflush(stdout);
-        }
-    }
-
-    printf("\n");
-    results.ppl_value = total_ppl.count > 0 ? std::exp(total_ppl.nll / total_ppl.count) : 0.0;
-    print_final_ppl(total_ppl);
-
-    return results;
-}
 
 static void write_logfile(
     const llama_context * ctx, const gpt_params & params, const llama_model * model,
@@ -2233,12 +1976,195 @@ static void kl_divergence(llama_context * ctx, const gpt_params & params) {
 
 }
 
-static void print_usage(int argc, char ** argv, const gpt_params & params) {
-    gpt_params_print_usage(argc, argv, params);
+struct ppl_stats {
+    double nll  = 0.0;
+    double nll2 = 0.0;
+    int    count = 0;
+};
 
-    LOG_TEE("\nextra usage:\n");
-    LOG_TEE("\n    %s [--split-on \"### CHAPTER\"] [--verbose-chunks]\n", argv[0]);
-    LOG_TEE("\n");
+static void print_final_ppl(const ppl_stats & stats) {
+    if (stats.count <= 0) {
+        return;
+    }
+
+    const double mean_nll  = stats.nll / stats.count;
+    double mean_nll2 = stats.nll2 / stats.count;
+    const double ppl = exp(mean_nll);
+
+    mean_nll2 -= mean_nll * mean_nll;
+    if (mean_nll2 > 0 && stats.count > 1) {
+        mean_nll2 = sqrt(mean_nll2 / (stats.count - 1));
+        printf("Final estimate: PPL = %.4lf +/- %.5lf\n", ppl, mean_nll2 * ppl);
+    } else {
+        printf("Final estimate: PPL = %.4lf\n", ppl);
+    }
+}
+
+static std::vector<std::string> split_exact(const std::string & text, const std::string & needle) {
+    if (needle.empty()) {
+        return {text};
+    }
+
+    std::vector<std::string> parts;
+    size_t start = 0;
+
+    while (true) {
+        const size_t pos = text.find(needle, start);
+        if (pos == std::string::npos) {
+            parts.emplace_back(text.substr(start));
+            break;
+        }
+        parts.emplace_back(text.substr(start, pos - start));
+        start = pos + needle.size();
+    }
+
+    return parts;
+}
+
+static void print_chunk_stdout(size_t chunk_idx, size_t chunk_total, const std::string & chunk) {
+    std::fprintf(stdout, "\n===== chunk %zu/%zu =====\n", chunk_idx + 1, chunk_total);
+    std::fwrite(chunk.data(), 1, chunk.size(), stdout);
+    if (chunk.empty() || chunk.back() != '\n') {
+        std::fputc('\n', stdout);
+    }
+    std::fprintf(stdout, "===== end chunk %zu/%zu =====\n", chunk_idx + 1, chunk_total);
+    std::fflush(stdout);
+}
+
+static bool perplexity_tokens(
+        llama_context * ctx,
+        const gpt_params & params,
+        std::vector<llama_token> tokens,
+        ppl_stats * ppl_accum,
+        bool print_ppl_progress,
+        bool print_ppl_final) {
+    const bool add_bos = llama_should_add_bos_token(llama_get_model(ctx));
+    GGML_ASSERT(llama_add_eos_token(llama_get_model(ctx)) != 1);
+
+    const int max_ctx = llama_n_ctx(ctx);
+    const int n_tokens = (int)tokens.size();
+
+    if (n_tokens < 2) {
+        fprintf(stderr, "%s: chunk too short (%d tokens), skipping\n", __func__, n_tokens);
+        return true;
+    }
+
+    if (n_tokens > max_ctx) {
+        fprintf(stderr, "%s: chunk has %d tokens, truncating to context limit %d\n", __func__, n_tokens, max_ctx);
+        tokens.resize(max_ctx);
+    }
+
+    const int n_eval_tokens = (int)tokens.size();
+    const int n_vocab = llama_n_vocab(llama_get_model(ctx));
+    const int n_batch = params.n_batch;
+    const int total_windows = (n_eval_tokens + max_ctx - 1) / max_ctx;
+
+    int count = 0;
+    double nll = 0.0;
+    double nll2 = 0.0;
+
+    fprintf(stderr, "%s: processing segment with %d token(s), batch_size %d\n",
+            __func__, n_eval_tokens, n_batch);
+
+    size_t worker_count = std::thread::hardware_concurrency();
+    if (worker_count > 0) {
+        --worker_count;
+    }
+    std::vector<std::thread> workers(worker_count);
+
+    for (int window = 0, offset = 0; offset < n_eval_tokens; ++window, offset += max_ctx) {
+        const int ctx_len = std::min(max_ctx, n_eval_tokens - offset);
+        const int num_batches = (ctx_len + n_batch - 1) / n_batch;
+
+        std::vector<float> logits;
+        if (num_batches > 1) {
+            logits.reserve((size_t)ctx_len * n_vocab);
+        }
+
+        const auto t_start = std::chrono::high_resolution_clock::now();
+
+        llama_kv_cache_clear(ctx);
+
+        for (int j = 0; j < num_batches; ++j) {
+            const int batch_start = offset + j * n_batch;
+            const int batch_size  = std::min(ctx_len - j * n_batch, n_batch);
+
+            if (batch_size <= 0) {
+                break;
+            }
+
+            const auto token_org = tokens[batch_start];
+            if (add_bos && j == 0) {
+                tokens[batch_start] = llama_token_bos(llama_get_model(ctx));
+            }
+
+            if (llama_decode(ctx, llama_batch_get_one(tokens.data() + batch_start, batch_size, j * n_batch, 0))) {
+                fprintf(stderr, "%s : failed to eval\n", __func__);
+                return false;
+            }
+
+            tokens[batch_start] = token_org;
+
+            if (num_batches > 1) {
+                const auto * batch_logits = llama_get_logits(ctx);
+                logits.insert(logits.end(), batch_logits, batch_logits + batch_size * n_vocab);
+            }
+        }
+
+        const auto t_end = std::chrono::high_resolution_clock::now();
+
+        if (window == 0) {
+            const float t_total = std::chrono::duration<float>(t_end - t_start).count();
+            fprintf(stderr, "%s: %.2f seconds per pass - ETA ", __func__, t_total);
+            int total_seconds = (int)(t_total * total_windows);
+            if (total_seconds >= 60*60) {
+                fprintf(stderr, "%d hours ", total_seconds / (60*60));
+                total_seconds = total_seconds % (60*60);
+            }
+            fprintf(stderr, "%.2f minutes\n", total_seconds / 60.0);
+        }
+
+        // Compute perplexity on the last half of the window
+        const int first = ctx_len / 2;
+        if (ctx_len - 1 - first > 0) {
+            const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits(ctx);
+            std::vector<float> dummy_logit_history(ctx_len - 1 - first);
+            std::vector<float> dummy_prob_history(ctx_len - 1 - first);
+            process_logits(n_vocab, all_logits + first * n_vocab, tokens.data() + offset + first, ctx_len - 1 - first,
+                           workers, nll, nll2, dummy_logit_history.data(), dummy_prob_history.data());
+            count += ctx_len - first - 1;
+
+            if (print_ppl_progress) {
+                printf("[%d/%d]%.4lf,", window + 1, total_windows, std::exp(nll / count));
+                fflush(stdout);
+            }
+        }
+    }
+
+    if (print_ppl_progress) {
+        printf("\n");
+    }
+
+    if (ppl_accum != nullptr) {
+        ppl_accum->nll  += nll;
+        ppl_accum->nll2 += nll2;
+        ppl_accum->count += count;
+    }
+
+    if (print_ppl_final && count > 0) {
+        nll2 /= count;
+        nll /= count;
+        const double ppl = exp(nll);
+        nll2 -= nll * nll;
+        if (nll2 > 0) {
+            nll2 = sqrt(nll2/(count-1));
+            printf("Final estimate: PPL = %.4lf +/- %.5lf\n", ppl, nll2*ppl);
+        } else {
+            printf("Unexpected negative standard deviation of log(prob)\n");
+        }
+    }
+
+    return true;
 }
 
 int main(int argc, char ** argv) {
@@ -2246,6 +2172,20 @@ int main(int argc, char ** argv) {
 
     params.n_ctx = 512;
     params.logits_all = true;
+
+    if (!gpt_params_parse(args.size(), args.data(), params)) {
+        gpt_params_print_usage(argc, argv, params);
+        return 1;
+    }
+
+    const int32_t n_ctx = params.n_ctx;
+
+    if (n_ctx <= 0) {
+        fprintf(stderr, "%s: perplexity tool requires '--ctx-size' > 0\n", __func__);
+        return 1;
+    }
+
+    const bool ppl = !params.hellaswag && !params.winogrande && !params.multiple_choice && !params.kl_divergence;
 
     bool verbose_chunks = false;
     std::string split_on;
@@ -2265,20 +2205,6 @@ int main(int argc, char ** argv) {
             args.push_back(argv[i]);
         }
     }
-
-    if (!gpt_params_parse((int) args.size(), args.data(), params)) {
-        print_usage(argc, argv, params);
-        return 1;
-    }
-
-    const int32_t n_ctx = params.n_ctx;
-
-    if (n_ctx <= 0) {
-        fprintf(stderr, "%s: perplexity tool requires '--ctx-size' > 0\n", __func__);
-        return 1;
-    }
-
-    const bool ppl = !params.hellaswag && !params.winogrande && !params.multiple_choice && !params.kl_divergence;
 
     if (ppl) {
         const int32_t n_seq = std::max(1, params.n_batch / n_ctx);
@@ -2302,6 +2228,12 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "Will perform strided perplexity calculation -> adjusting context size from %d to %d\n",
                 params.n_ctx, params.n_ctx + params.ppl_stride/2);
         params.n_ctx += params.ppl_stride/2;
+    }
+
+    // --split-on is incompatible with ppl stride, fall back to standard behaviour
+    if (!split_on.empty() && params.ppl_stride > 0) {
+        fprintf(stderr, "%s: warning: --split-on is not supported with --ppl-stride, ignoring split.\n", __func__);
+        split_on.clear();
     }
 
     print_build_info();
@@ -2349,10 +2281,101 @@ int main(int argc, char ** argv) {
         multiple_choice_score(ctx, params);
     } else if (params.kl_divergence) {
         kl_divergence(ctx, params);
-    } else if (!split_on.empty()) {
-        results = perplexity_split(ctx, params, split_on, verbose_chunks);
-    } else {
-        results = perplexity(ctx, params, n_ctx);
+        } else {
+        if (!split_on.empty()) {
+            if (!params.logits_file.empty()) {
+                fprintf(stderr, "%s: warning: --logits-file is not supported with --split-on, ignoring file.\n", __func__);
+            }
+
+            auto tim1 = std::chrono::high_resolution_clock::now();
+            fprintf(stderr, "%s: splitting on exact string: '%s'\n", __func__, split_on.c_str());
+
+            std::vector<std::string> raw_parts = split_exact(params.prompt, split_on);
+            std::vector<std::string> chunks;
+            chunks.reserve(raw_parts.size());
+            for (const auto & part : raw_parts) {
+                if (!part.empty()) {
+                    chunks.push_back(part);
+                }
+            }
+
+            auto tim2 = std::chrono::high_resolution_clock::now();
+            fprintf(stderr, "%s: split into %zu non-empty chunk(s) in %g ms\n",
+                    __func__, chunks.size(), 1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2 - tim1).count());
+
+            if (params.i_chunk > 0) {
+                if ((size_t)params.i_chunk >= chunks.size()) {
+                    fprintf(stderr, "%s: there will be not enough chunks left after removing %d chunks\n", __func__, params.i_chunk);
+                    return 1;
+                }
+                fprintf(stderr, "%s: removing initial %d chunk(s)\n", __func__, params.i_chunk);
+                chunks.erase(chunks.begin(), chunks.begin() + params.i_chunk);
+            }
+
+            fprintf(stderr, "%s: %zu chunk(s) will be processed\n", __func__, chunks.size());
+
+            struct chunk_tokens_info {
+                std::string chunk;
+                std::vector<llama_token> tokens;
+            };
+
+            std::vector<chunk_tokens_info> tokenized_chunks;
+            tokenized_chunks.reserve(chunks.size());
+
+            auto token_start = std::chrono::high_resolution_clock::now();
+            for (const auto & chunk : chunks) {
+                tokenized_chunks.push_back({chunk, ::common_tokenize(ctx, chunk, true)});
+            }
+            auto token_end = std::chrono::high_resolution_clock::now();
+
+            fprintf(stderr, "%s: tokenization of %zu chunk(s) took %g ms\n",
+                    __func__, tokenized_chunks.size(),
+                    1e-3*std::chrono::duration_cast<std::chrono::microseconds>(token_end - token_start).count());
+
+            const int n_ctx = llama_n_ctx(ctx);
+            fprintf(stderr, "%s: chunk token sizes:\n", __func__);
+            for (size_t i = 0; i < tokenized_chunks.size(); ++i) {
+                const size_t n_tok = tokenized_chunks[i].tokens.size();
+                if (n_tok > (size_t)n_ctx) {
+                    fprintf(stderr, "%s:   chunk %zu -> %zu token(s), will be truncated to %d\n",
+                            __func__, i + 1, n_tok, n_ctx);
+                } else if (n_tok < (size_t)n_ctx) {
+                    fprintf(stderr, "%s:   chunk %zu -> %zu token(s), using chunk length (< ctx %d)\n",
+                            __func__, i + 1, n_tok, n_ctx);
+                } else {
+                    fprintf(stderr, "%s:   chunk %zu -> %zu token(s), exactly at ctx limit\n",
+                            __func__, i + 1, n_tok);
+                }
+            }
+
+            ppl_stats total_ppl;
+
+            for (size_t i = 0; i < tokenized_chunks.size(); ++i) {
+                if (verbose_chunks) {
+                    print_chunk_stdout(i, tokenized_chunks.size(), tokenized_chunks[i].chunk);
+                }
+
+                if (!perplexity_tokens(
+                            ctx,
+                            params,
+                            std::move(tokenized_chunks[i].tokens),
+                            &total_ppl,
+                            false,
+                            false)) {
+                    return 1;
+                }
+
+                if (total_ppl.count > 0) {
+                    printf("[%zu/%zu]%.4lf,", i + 1, tokenized_chunks.size(), std::exp(total_ppl.nll / total_ppl.count));
+                    fflush(stdout);
+                }
+            }
+
+            printf("\n");
+            print_final_ppl(total_ppl);
+        } else {
+            results = perplexity(ctx, params, n_ctx);
+        }
     }
 
     llama_print_timings(ctx);
