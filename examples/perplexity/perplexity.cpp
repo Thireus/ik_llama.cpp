@@ -2183,9 +2183,6 @@ static bool perplexity_tokens(
             const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits(ctx);
             std::vector<float> dummy_logit_history(ctx_len - 1 - first);
             std::vector<float> dummy_prob_history(ctx_len - 1 - first);
-            const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits(ctx);
-            std::vector<float> dummy_logit_history(ctx_len - 1 - first);
-            std::vector<float> dummy_prob_history(ctx_len - 1 - first);
 
             if (logits_stream != nullptr) {
                 std::vector<uint16_t> packed_log_probs(size_t(ctx_len - 1 - first) * (2*((n_vocab + 1)/2) + 4));
