@@ -2212,9 +2212,9 @@ int main(int argc, char ** argv) {
     }
 
     // --split-on is incompatible with ppl stride, fall back to standard behaviour
-    if (!split_on.empty() && params.ppl_stride > 0) {
+    if (!params.split_on.empty() && params.ppl_stride > 0) {
         fprintf(stderr, "%s: warning: --split-on is not supported with --ppl-stride, ignoring split.\n", __func__);
-        split_on.clear();
+        params.split_on.clear();
     }
 
     print_build_info();
@@ -2263,15 +2263,15 @@ int main(int argc, char ** argv) {
     } else if (params.kl_divergence) {
         kl_divergence(ctx, params);
     } else {
-        if (!split_on.empty()) {
+        if (!params.split_on.empty()) {
             if (!params.logits_file.empty()) {
                 fprintf(stderr, "%s: warning: --logits-file is not supported with --split-on, ignoring file.\n", __func__);
             }
 
             auto tim1 = std::chrono::high_resolution_clock::now();
-            fprintf(stderr, "%s: splitting on exact string: '%s'\n", __func__, split_on.c_str());
+            fprintf(stderr, "%s: splitting on exact string: '%s'\n", __func__, params.split_on.c_str());
 
-            std::vector<std::string> raw_parts = split_exact(params.prompt, split_on);
+            std::vector<std::string> raw_parts = split_exact(params.prompt, params.split_on);
             std::vector<std::string> chunks;
             chunks.reserve(raw_parts.size());
             for (const auto & part : raw_parts) {
@@ -2318,7 +2318,7 @@ int main(int argc, char ** argv) {
             for (size_t i = 0; i < tokenized_chunks.size(); ++i) {
                 const size_t n_tok = tokenized_chunks[i].tokens.size();
                 if (n_tok > (size_t)n_ctx) {
-                    fprintf(stderr, "%s:   chunk %zu -> %zu token(s), will be truncated to %d\n",
+                    fprintf(stderr, "%s:   chunk %zu -> %zu token(s), will be truncated to %zu\n",
                             __func__, i + 1, n_tok, n_ctx);
                 } else if (n_tok < (size_t)n_ctx) {
                     fprintf(stderr, "%s:   chunk %zu -> %zu token(s), using chunk length (< ctx %d)\n",
@@ -2332,7 +2332,7 @@ int main(int argc, char ** argv) {
             ppl_stats total_ppl;
 
             for (size_t i = 0; i < tokenized_chunks.size(); ++i) {
-                if (verbose_chunks) {
+                if (params.verbose_chunks) {
                     print_chunk_stdout(i, tokenized_chunks.size(), tokenized_chunks[i].chunk);
                 }
 
