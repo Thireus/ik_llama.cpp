@@ -612,7 +612,11 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                         m_last_input.resize(src1->ne[0]*src1->ne[1]);
                     } else {
                         if (m_last_input.size() != src1->ne[0]*src1->ne[1]) {
-                            printf("Oops\n"); exit(1);
+                            fprintf(stderr,
+                                    "Oops: tensor=%s src0=%s last_layer=%d current_layer=%d last_input=%zu current=%d\n",
+                                    src0->name, src1->name, m_last_layer, int(*index),
+                                    m_last_input.size(), int(src1->ne[0]*src1->ne[1]));
+                            exit(1);
                         }
                     }
                     //printf("Copying src1 to m_last_input\n");
