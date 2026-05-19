@@ -1006,8 +1006,9 @@ static bool compute_draft_imatrix_batch(
 }
 
 static bool compute_imatrix_tokens(
-        llama_context * ctx, llama_context * ctx_dft = nullptr,
+        llama_context * ctx,
         const gpt_params & params,
+        llama_context * ctx_dft = nullptr,
         std::vector<llama_token> tokens,
         ppl_stats * ppl_accum,
         bool print_ppl_progress,
@@ -1185,7 +1186,7 @@ static bool compute_imatrix(llama_context * ctx, const gpt_params & params, llam
             tokens.erase(tokens.begin(), tokens.begin() + params.i_chunk*n_ctx);
         }
 
-        return compute_imatrix_tokens(ctx, ctx_dft, params, std::move(tokens), nullptr, true, true);
+        return compute_imatrix_tokens(ctx, params, ctx_dft, std::move(tokens), nullptr, true, true);
     }
 
     auto tim1 = std::chrono::high_resolution_clock::now();
@@ -1256,11 +1257,12 @@ static bool compute_imatrix(llama_context * ctx, const gpt_params & params, llam
             print_chunk_stdout(i, tokenized_chunks.size(), tokenized_chunks[i].chunk);
         }
 
-        g_collector.reset_lsim_state();
+        g_target_collector.reset_lsim_state();
 
         if (!compute_imatrix_tokens(
-                    ctx, ctx_dft,
+                    ctx,
                     params,
+                    ctx_dft,
                     std::move(tokenized_chunks[i].tokens),
                     params.compute_ppl ? &total_ppl : nullptr,
                     false,
