@@ -1450,7 +1450,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s\n", gpt_params_get_system_info(params).c_str());
     }
 
-    if (!compute_imatrix(ctx, params, ctx_dft, split_on, verbose_chunks)) {
+    if (!compute_imatrix(ctx, params, split_on, verbose_chunks, ctx_dft)) {
         if (ctx_dft != nullptr) {
             llama_free(ctx_dft);
         }
