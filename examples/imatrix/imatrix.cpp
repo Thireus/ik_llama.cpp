@@ -483,28 +483,194 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
     const float * data = is_host ? (const float *) src1->data : (const float *)m_src1_data.data();
 
     if (m_collect_lsim) {
+
+        // ============================================================
+        // FFN similarity tracking
+        // ============================================================
+
         if (wname.find(".ffn_") != std::string::npos) {
-            if (auto index = layer_index(wname); index.has_value() && *index == m_last_layer && *index != m_last_ffn) {
-                int n = src1->ne[0];
-                int nrow = t->op == GGML_OP_MUL_MAT_ID ? src1->ne[2] : src1->ne[1];
+            if (auto index = layer_index(wname);
+                index.has_value() &&
+                *index == m_last_layer &&
+                *index != m_last_ffn) {
+
+                const int n =
+                    src1->ne[0];
+
+                const int nrow =
+                    t->op == GGML_OP_MUL_MAT_ID
+                        ? src1->ne[2]
+                        : src1->ne[1];
+
                 if (t->op == GGML_OP_MUL_MAT_ID) {
                     GGML_ASSERT(src1->ne[1] == 1);
                 }
-                if (m_ffn_input.empty()) {
-                    m_ffn_input.resize(nrow*n);
+
+                const size_t cur_size =
+                    size_t(nrow) * size_t(n);
+
+                if (!m_ffn_input.empty() &&
+                    m_ffn_input.size() != cur_size) {
+
+                    fprintf(stderr,
+                            "Oops: ffn tensor=%s src0=%s "
+                            "last_layer=%d current_layer=%d "
+                            "last_ffn=%d ffn_input=%zu current=%zu "
+                            "(n=%d nrow=%d); skipping ffn lsim compare\n",
+                            wname.c_str(),
+                            src0->name,
+                            m_last_layer,
+                            int(*index),
+                            m_last_ffn,
+                            m_ffn_input.size(),
+                            cur_size,
+                            n,
+                            nrow);
+                }
+
+                m_ffn_input.resize(cur_size);
+
+                std::memcpy(
+                    m_ffn_input.data(),
+                    data,
+                    cur_size * sizeof(float));
+
+                if (m_last_input.size() == cur_size) {
+
+                    if (m_attn_sim.size() < *index + 1) {
+                        m_attn_sim.resize(*index + 1);
+                    }
+
+                    auto & p =
+                        m_attn_sim[*index];
+
+                    collect_cos_similarity(
+                        nrow,
+                        n,
+                        m_ffn_input.data(),
+                        m_last_input.data(),
+                        p);
+
                 } else {
-                    if ((int)m_ffn_input.size() != nrow*n) {
-                        printf("Oops, inconsistent ffn size\n"); exit(1);
+
+                    fprintf(stderr,
+                            "Oops: ffn-vs-last-input mismatch "
+                            "tensor=%s src0=%s "
+                            "last_layer=%d current_layer=%d "
+                            "last_input=%zu current=%zu "
+                            "(n=%d nrow=%d); skipping ffn lsim compare\n",
+                            wname.c_str(),
+                            src0->name,
+                            m_last_layer,
+                            int(*index),
+                            m_last_input.size(),
+                            cur_size,
+                            n,
+                            nrow);
+                }
+
+                m_last_ffn =
+                    *index;
+            }
+        }
+
+        // ============================================================
+        // Layer similarity tracking
+        // ============================================================
+
+        // We only need to do it here and not in the MoE branch above
+        // because the first tensor in a layer never is a MoE tensor
+
+        if (auto index = layer_index(wname); index.has_value()) {
+
+            const size_t cur_size =
+                size_t(src1->ne[0]) *
+                size_t(src1->ne[1]);
+
+            if (*index != m_last_layer) {
+
+                if (*index > 0) {
+
+                    if (m_last_input.size() != cur_size) {
+
+                        fprintf(stderr,
+                                "Oops: tensor=%s src0=%s "
+                                "last_layer=%d current_layer=%d "
+                                "last_input=%zu current=%zu "
+                                "(ne0=%lld ne1=%lld); skipping lsim compare\n",
+                                wname.c_str(),
+                                src0->name,
+                                m_last_layer,
+                                int(*index),
+                                m_last_input.size(),
+                                cur_size,
+                                (long long) src1->ne[0],
+                                (long long) src1->ne[1]);
+
+                    } else {
+
+                        if (*index > (int)m_layer_sim.size()) {
+                            m_layer_sim.resize(*index);
+                        }
+
+                        auto & p =
+                            m_layer_sim[*index - 1];
+
+                        collect_cos_similarity(
+                            src1->ne[1],
+                            src1->ne[0],
+                            m_last_input.data(),
+                            (const float *) data,
+                            p);
+
+                        if (*index == m_last_ffn + 1) {
+
+                            if (*index > (int)m_ffn_sim.size()) {
+                                m_ffn_sim.resize(*index);
+                            }
+
+                            auto & p1 =
+                                m_ffn_sim[*index - 1];
+
+                            if (m_ffn_input.size() == cur_size) {
+
+                                collect_cos_similarity(
+                                    src1->ne[1],
+                                    src1->ne[0],
+                                    m_ffn_input.data(),
+                                    (const float *) data,
+                                    p1);
+
+                            } else {
+
+                                fprintf(stderr,
+                                        "Oops: layer-vs-ffn mismatch "
+                                        "tensor=%s src0=%s "
+                                        "last_layer=%d current_layer=%d "
+                                        "ffn_input=%zu current=%zu "
+                                        "(ne0=%lld ne1=%lld); skipping ffn similarity\n",
+                                        wname.c_str(),
+                                        src0->name,
+                                        m_last_layer,
+                                        int(*index),
+                                        m_ffn_input.size(),
+                                        cur_size,
+                                        (long long) src1->ne[0],
+                                        (long long) src1->ne[1]);
+                            }
+                        }
                     }
                 }
-                std::memcpy(m_ffn_input.data(), data, nrow*n*sizeof(float));
-                if (m_ffn_input.size() != m_last_input.size()) {
-                    printf("Oops, inconsistent ffn vs last_input size\n"); exit(1);
-                }
-                if (m_attn_sim.size() < *index + 1) m_attn_sim.resize(*index + 1);
-                auto& p = m_attn_sim[*index];
-                collect_cos_similarity(nrow, n, m_ffn_input.data(), m_last_input.data(), p);
-                m_last_ffn = *index;
+
+                m_last_layer =
+                    *index;
+
+                m_last_input.resize(cur_size);
+
+                std::memcpy(
+                    m_last_input.data(),
+                    data,
+                    cur_size * sizeof(float));
             }
         }
     }
