@@ -1008,11 +1008,11 @@ static bool compute_draft_imatrix_batch(
 static bool compute_imatrix_tokens(
         llama_context * ctx,
         const gpt_params & params,
-        llama_context * ctx_dft = nullptr,
         std::vector<llama_token> tokens,
         ppl_stats * ppl_accum,
         bool print_ppl_progress,
-        bool print_ppl_final) {
+        bool print_ppl_final,
+        llama_context * ctx_dft = nullptr) {
     const bool add_bos = llama_should_add_bos_token(llama_get_model(ctx));
     GGML_ASSERT(llama_add_eos_token(llama_get_model(ctx)) != 1);
 
@@ -1166,7 +1166,7 @@ static bool compute_imatrix_tokens(
     return true;
 }
 
-static bool compute_imatrix(llama_context * ctx, const gpt_params & params, llama_context * ctx_dft = nullptr, const std::string & split_on, bool verbose_chunks) {
+static bool compute_imatrix(llama_context * ctx, const gpt_params & params, const std::string & split_on, bool verbose_chunks, llama_context * ctx_dft = nullptr) {
     if (split_on.empty()) {
         auto tim1 = std::chrono::high_resolution_clock::now();
         fprintf(stderr, "%s: tokenizing the input ..\n", __func__);
@@ -1186,7 +1186,7 @@ static bool compute_imatrix(llama_context * ctx, const gpt_params & params, llam
             tokens.erase(tokens.begin(), tokens.begin() + params.i_chunk*n_ctx);
         }
 
-        return compute_imatrix_tokens(ctx, params, ctx_dft, std::move(tokens), nullptr, true, true);
+        return compute_imatrix_tokens(ctx, params, std::move(tokens), nullptr, true, true, ctx_dft);
     }
 
     auto tim1 = std::chrono::high_resolution_clock::now();
@@ -1262,11 +1262,11 @@ static bool compute_imatrix(llama_context * ctx, const gpt_params & params, llam
         if (!compute_imatrix_tokens(
                     ctx,
                     params,
-                    ctx_dft,
                     std::move(tokenized_chunks[i].tokens),
                     params.compute_ppl ? &total_ppl : nullptr,
                     false,
-                    false)) {
+                    false,
+                    ctx_dft)) {
             return false;
         }
 
