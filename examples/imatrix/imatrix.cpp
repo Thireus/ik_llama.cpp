@@ -591,36 +591,51 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
             // We only need to do it here and not in the MoE branch above because the first tensor in a layer
             // never is a MoE tensor
             if (auto index = layer_index(wname); index.has_value()) {
+                const size_t cur_size = size_t(src1->ne[0]) * size_t(src1->ne[1]);
+
                 if (*index != m_last_layer) {
                     if (*index > 0) {
-                        if (m_last_input.size() != src1->ne[0]*src1->ne[1]) {
-                            printf("Oops: different size (%d vs %d). Tensor name was %s, m_last_layer = %d\n",
-                                    (int)(src1->ne[0]*src1->ne[1]), (int)m_last_input.size(), src0->name, m_last_layer);
-                            exit(1);
-                        }
-                        if (*index > m_layer_sim.size()) m_layer_sim.resize(*index);
-                        auto& p = m_layer_sim[*index - 1];
-                        collect_cos_similarity(src1->ne[1], src1->ne[0], m_last_input.data(), (const float *)data, p);
-                        if (*index == m_last_ffn + 1) {
-                            if (*index > m_ffn_sim.size()) m_ffn_sim.resize(*index);
-                            auto& p1 = m_ffn_sim[*index-1];
-                            collect_cos_similarity(src1->ne[1], src1->ne[0], m_ffn_input.data(), (const float *)data, p1);
-                        }
-                    }
-                    m_last_layer = *index;
-                    if (m_last_input.empty()) {
-                        m_last_input.resize(src1->ne[0]*src1->ne[1]);
-                    } else {
-                        if (m_last_input.size() != src1->ne[0]*src1->ne[1]) {
+                        if (m_last_input.size() != cur_size) {
                             fprintf(stderr,
-                                    "Oops: tensor=%s src0=%s last_layer=%d current_layer=%d last_input=%zu current=%d\n",
-                                    src0->name, src1->name, m_last_layer, int(*index),
-                                    m_last_input.size(), int(src1->ne[0]*src1->ne[1]));
-                            exit(1);
+                                    "Oops: tensor=%s src0=%s last_layer=%d current_layer=%d last_input=%zu current=%zu; skipping lsim compare\n",
+                                    wname.c_str(), src0->name, m_last_layer, int(*index),
+                                    m_last_input.size(), cur_size);
+                        } else {
+                            if (*index > (int)m_layer_sim.size()) m_layer_sim.resize(*index);
+
+                            auto & p = m_layer_sim[*index - 1];
+
+                            collect_cos_similarity(
+                                src1->ne[1],
+                                src1->ne[0],
+                                m_last_input.data(),
+                                (const float *) data,
+                                p);
+
+                            if (*index == m_last_ffn + 1) {
+                                if (*index > (int)m_ffn_sim.size()) {
+                                    m_ffn_sim.resize(*index);
+                                }
+
+                                auto & p1 = m_ffn_sim[*index - 1];
+
+                                collect_cos_similarity(
+                                    src1->ne[1],
+                                    src1->ne[0],
+                                    m_ffn_input.data(),
+                                    (const float *) data,
+                                    p1);
+                            }
                         }
                     }
-                    //printf("Copying src1 to m_last_input\n");
-                    std::memcpy(m_last_input.data(), data, src1->ne[0]*src1->ne[1]*sizeof(float));
+
+                    m_last_layer = *index;
+                    m_last_input.resize(cur_size);
+
+                    std::memcpy(
+                        m_last_input.data(),
+                        data,
+                        cur_size * sizeof(float));
                 }
             }
         }
