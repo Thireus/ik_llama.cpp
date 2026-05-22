@@ -26,7 +26,7 @@ ggml_cgraph * llm_build_context::build_glm4_moe() {
         } else {
             hidden_states_from_main_model = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hparams.n_embd);
         }
-        ggml_set_name(hidden_states_from_main_model, "result_embd_pooled");
+        ggml_set_name(hidden_states_from_main_model, "inp_mtp_states");
         ggml_set_input(hidden_states_from_main_model);
 
         lctx.inp_mtp_states = hidden_states_from_main_model;
@@ -34,7 +34,7 @@ ggml_cgraph * llm_build_context::build_glm4_moe() {
         const int il_mtp = hparams.n_layer - 1;
         const auto & mtp_layer = model.layers[il_mtp];
 
-        cur = build_mtp_tail(mtp_layer, hidden_states_from_main_model, n_embd_head, gf, inp_pos, rope_cache);
+        cur = build_glm4_moe_mtp(mtp_layer, hidden_states_from_main_model, n_embd_head, gf, inp_pos, rope_cache);
 
     } else {
         struct ggml_tensor * inpL;
@@ -288,7 +288,7 @@ ggml_cgraph * llm_build_context::build_glm4() {
     return gf;
 }
 
-struct ggml_tensor * llm_build_context::build_mtp_tail(
+struct ggml_tensor * llm_build_context::build_glm4_moe_mtp(
     const llama_layer & mtp_layer,
     struct ggml_tensor * prev_embeddings,
     int64_t n_embd_head,
@@ -350,7 +350,7 @@ struct ggml_tensor * llm_build_context::build_mtp_tail(
         cb(ffn_inp, "mtp_ffn_inp", il);
     }
 
-    // FFN
+    // MoE FFN
     cur = llm_build_std_moe_ffn(ctx0, lctx, mtp_layer.ffn_norm, ffn_inp,
             mtp_layer.ffn_gate_inp,  NULL,
             mtp_layer.ffn_up_exps,   NULL,

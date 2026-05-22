@@ -4,9 +4,16 @@
 #include "common.h"
 #include "reasoning-budget.cpp"
 
+#include <limits>
 #include <random>
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#include <immintrin.h>
+#endif
 #include <nlohmann/json.hpp>
 using json = nlohmann::ordered_json;
+
+struct llama_sampler_adaptive_p * llama_clone_adaptive_p(const struct llama_sampler_adaptive_p * adapt_p_ctx);
+void llama_free_adaptive_p(struct llama_sampler_adaptive_p * adapt_p_ctx);
 
 struct common_sampler * common_sampler_init(const struct llama_model * model, const struct common_params_sampling & params) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -88,37 +95,37 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, co
         result->grammar_str = grammar_str;
         result->grammar_root = "root";
     }
-    
 
-
+    // Compute prefill tokens from the generation prompt
+    std::vector<llama_token> prefill_tokens;
+    if (!params.generation_prompt.empty()) {
+        GGML_ASSERT(vocab != nullptr);
+        auto tokens = common_tokenize(vocab, params.generation_prompt, false, true);
+        for (size_t i = 0; i < tokens.size(); i++) {
+            std::string piece = common_token_to_piece(vocab, tokens[i], true);
+            if (i == 0 && std::isspace(piece[0]) && !std::isspace(params.generation_prompt[0])) {
+                // Some tokenizers will add a space before the first special token, need to exclude
+                continue;
+            }
+            LOG_DBG("%s: prefill token: %d = %s\n", __func__, tokens[i], piece.c_str());
+            prefill_tokens.push_back(tokens[i]);
+        }
+    }
 
     // Feed generation prompt tokens to the grammar sampler so it advances past
     // tokens the template already placed in the prompt.
     // Only applies to output-format and tool-call grammars; user-supplied grammars must not be prefilled.
-    std::vector<llama_token> prefill_tokens;
-    if (!params.generation_prompt.empty() && common_grammar_needs_prefill(params.grammar)) {
-        GGML_ASSERT(vocab != nullptr);
-        prefill_tokens = common_tokenize(vocab, params.generation_prompt, false, true);
-        if (!prefill_tokens.empty()) {
-            std::string first_token = common_token_to_piece(vocab, prefill_tokens[0], true);
-            if (std::isspace(first_token[0]) && !std::isspace(params.generation_prompt[0])) {
-                // Some tokenizers will add a space before the first special token, need to remove
-                prefill_tokens = std::vector<llama_token>(prefill_tokens.begin() + 1, prefill_tokens.end());
+    if (grmr && !params.grammar_lazy && common_grammar_needs_prefill(params.grammar)) {
+        try {
+            for (const auto & token : prefill_tokens) {
+                llama_grammar_accept_impl(*grmr, vocab, nullptr, token);
+                LOG_DBG("%s: grammar accepted prefill token (%d)\n", __func__, token);
             }
         }
-
-        if (grmr && !params.grammar_lazy) {
-            try {
-                for (const auto & token : prefill_tokens) {
-                    llama_grammar_accept_impl(*grmr, vocab, nullptr, token);
-                    LOG_DBG("%s: accepted prefill token (%d)\n", __func__, token);
-                }
-            }
-            catch (std::exception & e) {
-                LOG_ERR("%s: error initializing grammar sampler for grammar:\n%s\n\nGeneration prompt:\n'%s'\n", __func__,
-                    common_grammar_value(params.grammar).c_str(), params.generation_prompt.c_str());
-                throw e;
-            }
+        catch (std::exception & e) {
+            LOG_ERR("%s: error initializing grammar sampler for grammar:\n%s\n\nGeneration prompt:\n'%s'\n", __func__,
+                common_grammar_value(params.grammar).c_str(), params.generation_prompt.c_str());
+            throw e;
         }
     }
 
@@ -129,8 +136,12 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, co
             params.reasoning_budget_start,
             params.reasoning_budget_end,
             params.reasoning_budget_forced,
-            params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens,
-            prefill_tokens);
+            params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens);
+
+        for (const auto & token : prefill_tokens) {
+            common_reasoning_budget_accept(result->rbudget, token);
+            LOG_DBG("%s: reasoning-budget accepted prefill token (%d)\n", __func__, token);
+        }
     }
 
     llama_sampling_set_rng_seed(result, params.seed);
@@ -152,15 +163,20 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, co
             }
             case llama_sampler_type::ADAPTIVE_P:
             {
-                GGML_ASSERT(vocab);
-                auto n_vocab = llama_vocab_n_tokens(vocab);
-                result->adapt_p_ctx = llama_init_adaptive_p(n_vocab, params.adaptive_target, params.adaptive_decay, params.adaptive_updt_w_cur, result->rng());
+                if (params.adaptive_target >= 0.0f) {
+                    GGML_ASSERT(vocab);
+                    auto n_vocab = llama_vocab_n_tokens(vocab);
+                    result->adapt_p_ctx = llama_init_adaptive_p(n_vocab, params.adaptive_target, params.adaptive_decay, params.adaptive_updt_w_cur, result->rng());
+                }
                 break;
             }
             default:
                 break;
         }
     }
+
+    result->elb_idx = 0;
+    result->elb_search_pos = 0;
 
     return result;
 }
@@ -174,6 +190,8 @@ void common_sampler_free(struct common_sampler * ctx) {
     }
     if (ctx->smpl)
         llama_sampler_dry_free(ctx->smpl);
+    if (ctx->adapt_p_ctx)
+        llama_free_adaptive_p(ctx->adapt_p_ctx);
     if (ctx->rbudget)
         common_reasoning_budget_free(ctx->rbudget);
     delete ctx;
@@ -218,6 +236,12 @@ void llama_sampling_set_rng_seed(struct common_sampler * ctx, uint32_t seed) {
 }
 
 void common_sampler_clone(common_sampler * src, common_sampler * dst) {
+    dst->params = src->params;
+    dst->mirostat_mu = src->mirostat_mu;
+    dst->n_valid = src->n_valid;
+    dst->rng = src->rng;
+    dst->server_biases = src->server_biases;
+
     if (dst->grammar) {
         llama_grammar_free(dst->grammar);
         dst->grammar = nullptr;
@@ -230,7 +254,26 @@ void common_sampler_clone(common_sampler * src, common_sampler * dst) {
     }
 
     dst->prev = src->prev;
-    dst->smpl = llama_sampler_dry_clone(src->smpl);
+    if (dst->smpl) {
+        llama_sampler_dry_free(dst->smpl);
+        dst->smpl = nullptr;
+    }
+    if (src->smpl) {
+        dst->smpl = llama_sampler_dry_clone(src->smpl);
+    }
+
+    if (dst->adapt_p_ctx) {
+        llama_free_adaptive_p(dst->adapt_p_ctx);
+        dst->adapt_p_ctx = nullptr;
+    }
+    if (src->adapt_p_ctx) {
+        dst->adapt_p_ctx = llama_clone_adaptive_p(src->adapt_p_ctx);
+    }
+
+    if (dst->rbudget) {
+        common_reasoning_budget_free(dst->rbudget);
+        dst->rbudget = nullptr;
+    }
     if (src->rbudget) {
         dst->rbudget = common_reasoning_budget_clone(src->rbudget);
     }
@@ -426,7 +469,7 @@ static void sampler_queue(
                     llama_sample_temp(ctx_main, &cur_p, temp);
                 }
                 break;
-            case llama_sampler_type::ADAPTIVE_P:  use_adaptive_p = true; break;
+            case llama_sampler_type::ADAPTIVE_P:  use_adaptive_p = ctx_sampling->adapt_p_ctx != nullptr; break;
             default : break;
         }
 
@@ -588,6 +631,10 @@ static llama_token_data_array llama_sampling_prepare_impl(
         llama_sample_apply_guidance(ctx_main, logits, logits_guidance, params.cfg_scale);
     }
 
+    if (ctx_sampling->elb_states.size() > ctx_sampling->elb_idx) {
+        common_expiring_logit_bias_apply(ctx_sampling, logits);
+    }
+
     cur.resize(n_vocab);
 
     if ((ctx_sampling->server_biases != nullptr) && (ctx_sampling->server_biases->size() == n_vocab)) {
@@ -664,23 +711,27 @@ void common_sampler_accept(
         struct common_sampler * ctx_sampling,
         struct llama_context * ctx_main,
         llama_token token,
-        bool accept_grammar) {
+        bool is_generated) {
     if (ctx_sampling->prev.size() > 0) {
         ctx_sampling->prev.erase(ctx_sampling->prev.begin());
     }
     ctx_sampling->prev.push_back(token);
 
     // grammar_should_apply() checks the reasoning budget state, so calculate this before we accept
-    accept_grammar = accept_grammar && grammar_should_apply(ctx_sampling);
-    if (ctx_sampling->rbudget) {
+    const auto accept_grammar = is_generated && grammar_should_apply(ctx_sampling);
+    if (ctx_sampling->rbudget && is_generated) {
         common_reasoning_budget_accept(ctx_sampling->rbudget, token);
     }
 
-    if (ctx_sampling->grammar != NULL && accept_grammar) {
+    if (ctx_sampling->grammar && accept_grammar) {
         llama_grammar_accept_token(ctx_sampling->grammar, ctx_main, token);
     }
     if (ctx_sampling->smpl) {
         llama_sampler_dry_accept(ctx_sampling->smpl, token);
+    }
+
+    if (ctx_sampling->elb_states.size() > ctx_sampling->elb_idx) {
+        common_expiring_logit_bias_accept(ctx_sampling, ctx_main);
     }
 }
 
@@ -728,6 +779,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
+        gsmpl->drafted_text += common_token_to_piece(ctx, id, true);
+
         common_sampler_accept(gsmpl, ctx, id, true);
 
         result.push_back(id);
@@ -740,6 +793,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
+        gsmpl->drafted_text += common_token_to_piece(ctx, id, true);
+
         common_sampler_accept(gsmpl, ctx, id, true);
 
         result.push_back(id);
@@ -748,8 +803,85 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     return result;
 }
 
+void common_expiring_logit_bias_apply(struct common_sampler* ctx_sampling, float* logits) {
+    auto index_first_inactive = [](auto countup, auto& tokens) {
+        return std::distance(
+            tokens.begin(),
+            std::upper_bound(tokens.begin(), tokens.end(), countup, [](const auto& countup, const auto& token) {
+                return countup > token.duration;
+            })
+        );
+    };
 
+    const auto& elb = ctx_sampling->elb_states[ctx_sampling->elb_idx];
 
+    std::string combined_text;
+    const std::string* search_window = &combined_text;
+    if (!ctx_sampling->drafted_text.empty()) {
+        // add speculated tokens
+        combined_text = ctx_sampling->to_generated_text != nullptr ? (
+            ctx_sampling->to_generated_text->substr(std::max(0, int32_t(ctx_sampling->to_generated_text->length()) - elb.max_cond_len))
+        ) : "" + ctx_sampling->drafted_text;
+    } else if (ctx_sampling->to_generated_text != nullptr) {
+        search_window = ctx_sampling->to_generated_text;
+    }
+
+    if (!search_window->empty() && !elb.other_tokens.empty() && (elb.other_tokens.front().duration > elb.countup)) {
+        const auto ifi = index_first_inactive(elb.countup, elb.other_tokens);
+        for (size_t j = 0; j < ifi; ++j) {
+            const auto& [id, bias, _, cond] = elb.other_tokens[j];
+            if (string_ends_with(*search_window, cond)) {
+                logits[id] += bias;
+            }
+        }
+    }
+
+    if (!elb.first_tokens.empty() && (elb.first_tokens.front().duration > elb.countup)) {
+        const auto ifi = index_first_inactive(elb.countup, elb.first_tokens);
+        if (search_window->empty()) {
+            // empty case here
+            for (size_t j = 0; j < ifi; ++j) {
+                logits[elb.first_tokens[j].id] += elb.first_tokens[j].bias;
+            }
+        } else {
+            for (size_t j = 0; j < ifi; ++j) {
+                const auto& [id, bias, _, cond] = elb.first_tokens[j];
+                // no bias if seen (probably too late)
+                if (!string_ends_with(*search_window, cond)) {
+                    logits[id] += bias;
+                }
+            }
+        }
+    }
+}
+
+void common_expiring_logit_bias_accept(struct common_sampler* ctx_sampling, struct llama_context * ctx_main) {
+    if (ctx_sampling->to_generated_text == nullptr) {
+        // prompt processing
+        return;
+    }
+
+    auto& elb = ctx_sampling->elb_states[ctx_sampling->elb_idx];
+    const int32_t exitword_len = elb.exitword.length();
+    if ((elb.delay > ++elb.countup) || (exitword_len == 0)) {
+        return;
+    }
+
+    const std::string search_window = ctx_sampling->to_generated_text->substr(std::min(
+        ctx_sampling->to_generated_text->length(),
+        size_t(ctx_sampling->elb_search_pos)
+    )) + common_token_to_piece(ctx_main, ctx_sampling->prev.back(), true);
+
+    const auto exitword_pos = search_window.find(elb.exitword);
+    if (exitword_pos != std::string::npos) {
+        ++ctx_sampling->elb_idx;
+        // no double counting characters that matched
+        ctx_sampling->elb_search_pos += exitword_pos + exitword_len;
+    } else {
+        // move search position to include next token
+        ctx_sampling->elb_search_pos += std::max(0, int32_t(search_window.length()) - exitword_len + 1);
+    }
+}
 
 
 template <>
@@ -775,6 +907,127 @@ common_grammar_trigger common_grammar_trigger::from_json(const json& in) {
     return out;
 }
 
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+__attribute__((target("avx2")))
+static bool common_sampler_speculative_top1_avx2(const float * logits, const int n_vocab, int & best_id, float & max_val) {
+    if (n_vocab < 8) {
+        return false;
+    }
+
+    __m256  max_v = _mm256_loadu_ps(logits);
+    __m256i id_v  = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+
+    const __m256i step = _mm256_set1_epi32(8);
+    __m256i cur_id = _mm256_add_epi32(id_v, step);
+
+    int i = 8;
+    for (; i + 7 < n_vocab; i += 8) {
+        const __m256 x = _mm256_loadu_ps(logits + i);
+        const __m256 gt_max = _mm256_cmp_ps(x, max_v, _CMP_GT_OQ);
+
+        max_v = _mm256_blendv_ps(max_v, x, gt_max);
+        id_v  = _mm256_blendv_epi8(id_v, cur_id, _mm256_castps_si256(gt_max));
+        cur_id = _mm256_add_epi32(cur_id, step);
+    }
+
+    alignas(32) float max_buf[8];
+    alignas(32) int id_buf[8];
+    _mm256_store_ps(max_buf, max_v);
+    _mm256_store_si256((__m256i *) id_buf, id_v);
+
+    best_id = id_buf[0];
+    max_val = max_buf[0];
+
+    for (int j = 1; j < 8; ++j) {
+        if (max_buf[j] > max_val) {
+            max_val = max_buf[j]; best_id = id_buf[j];
+        }
+    }
+    for (; i < n_vocab; ++i) {
+
+        if (logits[i] > max_val) {
+            max_val = logits[i]; best_id = i;
+        }
+    }
+    return true;
+}
+__attribute__((target("avx2,fma")))
+static inline __m256 v_expf(__m256 x) {
+  const __m256 r = _mm256_set1_ps(0x1.8p23f);
+  const __m256 z = _mm256_fmadd_ps(x, _mm256_set1_ps(0x1.715476p+0f), r);
+  const __m256 n = _mm256_sub_ps(z, r);
+  const __m256 b = _mm256_fnmadd_ps(n, _mm256_set1_ps(0x1.7f7d1cp-20f),
+                                    _mm256_fnmadd_ps(n, _mm256_set1_ps(0x1.62e4p-1f), x));
+  const __m256i e = _mm256_slli_epi32(_mm256_castps_si256(z), 23);
+  const __m256 k = _mm256_castsi256_ps(
+      _mm256_add_epi32(e, _mm256_castps_si256(_mm256_set1_ps(1))));
+  const __m256i c = _mm256_castps_si256(
+      _mm256_cmp_ps(_mm256_andnot_ps(_mm256_set1_ps(-0.f), n),
+                    _mm256_set1_ps(126), _CMP_GT_OQ));
+  const __m256 u = _mm256_mul_ps(b, b);
+  const __m256 j = _mm256_fmadd_ps(_mm256_fmadd_ps(_mm256_fmadd_ps(_mm256_set1_ps(0x1.0e4020p-7f), b,
+                                                                   _mm256_set1_ps(0x1.573e2ep-5f)), u,
+                                                   _mm256_fmadd_ps(_mm256_set1_ps(0x1.555e66p-3f), b,
+                                                                   _mm256_set1_ps(0x1.fffdb6p-2f))),
+                                   u, _mm256_mul_ps(_mm256_set1_ps(0x1.ffffecp-1f), b));
+  if (!_mm256_movemask_ps(_mm256_castsi256_ps(c)))
+    return _mm256_fmadd_ps(j, k, k);
+  const __m256i g = _mm256_and_si256(
+      _mm256_castps_si256(_mm256_cmp_ps(n, _mm256_setzero_ps(), _CMP_LE_OQ)),
+      _mm256_set1_epi32(0x82000000u));
+  const __m256 s1 =
+      _mm256_castsi256_ps(_mm256_add_epi32(g, _mm256_set1_epi32(0x7f000000u)));
+  const __m256 s2 = _mm256_castsi256_ps(_mm256_sub_epi32(e, g));
+  const __m256i d = _mm256_castps_si256(
+      _mm256_cmp_ps(_mm256_andnot_ps(_mm256_set1_ps(-0.f), n),
+                    _mm256_set1_ps(192), _CMP_GT_OQ));
+  return _mm256_or_ps(
+      _mm256_and_ps(_mm256_castsi256_ps(d), _mm256_mul_ps(s1, s1)),
+      _mm256_andnot_ps(
+          _mm256_castsi256_ps(d),
+          _mm256_or_ps(
+              _mm256_and_ps(_mm256_castsi256_ps(c),
+                            _mm256_mul_ps(_mm256_fmadd_ps(s2, j, s2), s1)),
+              _mm256_andnot_ps(_mm256_castsi256_ps(c), _mm256_fmadd_ps(k, j, k)))));
+}
+__attribute__((target("avx2")))
+static inline float hsum_float_4(__m128 x) {
+    x = _mm_add_ps(x, _mm_movehl_ps(x, x));
+    x = _mm_add_ss(x, _mm_movehdup_ps(x));
+    return _mm_cvtss_f32(x);
+}
+__attribute__((target("avx2")))
+static inline float hsum_float_8(__m256 x) {
+    return hsum_float_4(_mm_add_ps(_mm256_castps256_ps128(x), _mm256_extractf128_ps(x, 1)));
+}
+__attribute__((target("avx2,fma")))
+static float prob_avx2(int n, const float * logits, float max_val) {
+    float sumf = 0;
+    int i = 0;
+    if (n >= 8) {
+        auto sum_v = _mm256_setzero_ps();
+        auto max_v = _mm256_set1_ps(max_val);
+        for (; i < n - 7; i += 8) {
+            auto x = _mm256_loadu_ps(logits + i);
+            auto exp_x = v_expf(_mm256_sub_ps(x, max_v));
+            sum_v = _mm256_add_ps(sum_v, exp_x);
+        }
+        sumf = hsum_float_8(sum_v);
+    }
+    for (; i < n; ++i) {
+        sumf += expf(logits[i] - max_val);
+    }
+    return 1.0f/sumf;
+}
+#endif
+static float prob_scalar(int n, const float * logits, float max_val) {
+    double sum_exp = 0.0;
+    for (int i = 0; i < n; ++i) {
+        sum_exp += exp((double)(logits[i] - max_val));
+    }
+    return (float)(1./sum_exp);
+}
+
 llama_token common_sampler_sample_speculative(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, float * out_prob) {
     GGML_UNUSED(gsmpl);
 
@@ -783,6 +1036,20 @@ llama_token common_sampler_sample_speculative(struct common_sampler * gsmpl, str
 
     int best_id = 0;
     float max_val = logits[0];
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+    static const bool has_avx2 = __builtin_cpu_supports("avx2");
+    if (has_avx2 && common_sampler_speculative_top1_avx2(logits, n_vocab, best_id, max_val)) {
+        if (out_prob) {
+            static const bool has_fma = __builtin_cpu_supports("fma");
+            if (has_fma) {
+                *out_prob = prob_avx2(n_vocab, logits, max_val);
+            } else {
+                *out_prob = prob_scalar(n_vocab, logits, max_val);
+            }
+        }
+        return best_id;
+    }
+#endif
     for (int i = 1; i < n_vocab; ++i) {
         if (logits[i] > max_val) {
             max_val = logits[i];
@@ -791,11 +1058,7 @@ llama_token common_sampler_sample_speculative(struct common_sampler * gsmpl, str
     }
 
     if (out_prob) {
-        double sum_exp = 0.0;
-        for (int i = 0; i < n_vocab; ++i) {
-            sum_exp += exp((double)(logits[i] - max_val));
-        }
-        *out_prob = (float)(1.0 / sum_exp);
+        *out_prob = prob_scalar(n_vocab, logits, max_val);
     }
 
     return best_id;

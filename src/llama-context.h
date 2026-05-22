@@ -4,6 +4,8 @@
 #include "llama-cparams.h"
 #include "llama-sampling.h"
 
+#include "llama-spec-features.h"
+
 struct llama_model;
 
 #include <vector>
@@ -59,9 +61,15 @@ struct llama_kv_cache {
     std::vector<struct ggml_tensor *> v_l;
     std::vector<struct ggml_tensor *> s_l; // per layer recurrent state storage (Qwen3Next)
 
+    // When true, the delta_net graph builder will enable per-step SSM state saves
+    bool save_per_step_ssm = false;
+
     std::vector<llama_split_tensor> split_k_l;
     std::vector<llama_split_tensor> split_v_l;
     std::vector<llama_split_tensor> split_s_l;
+
+    // Per-device replicas of the MLA compressed-latent KV cache (-sm graph for DEEPSEEK2/GLM_DSA/MISTRAL4).
+    std::vector<llama_split_tensor> replicated_k_l;
 
     std::vector<struct ggml_context *> ctxs;
     std::vector<ggml_backend_buffer_t> bufs;
@@ -73,6 +81,78 @@ struct llama_kv_cache {
         }
         return size;
     }
+
+    // GPU-resident checkpoint for recurrent/hybrid speculative decoding
+    struct gpu_checkpoint {
+        std::vector<llama_kv_cell> cells_snapshot;
+        uint32_t head_snapshot = 0;
+        uint32_t used_snapshot = 0;
+
+        std::vector<ggml_tensor *> s_l_shadow;
+
+        std::vector<std::vector<ggml_tensor *>> split_s_l_shadow;
+
+        // Per-step SSM state checkpoints for speculative decoding.
+        std::vector<std::vector<ggml_tensor *>> per_step_ssm;
+
+        // Per-step conv feature buffer: stores qkv_mixed features from the
+        // verification forward pass so conv state can be reconstructed at any step.
+        // One tensor per recurrent layer, each sized [conv_dim * max_tokens].
+        //std::vector<std::vector<ggml_tensor *>> per_step_qkv;
+        std::vector<std::vector<ggml_tensor *>> per_step_conv;
+
+        int32_t per_step_n_tokens = 0;
+        int32_t per_step_max_allocated = 0;
+        int64_t per_step_ssm_state_size = 0;
+        int64_t per_step_conv_state_dim = 0;
+        int64_t per_step_conv_dim = 0;
+        int32_t per_step_d_conv = 0;
+
+        int selected_spec_mode = -1;
+        int fixed_spec_mode = LLAMA_SPEC_CKPT_NONE;
+        int32_t fixed_max_tokens = 0;
+
+        // Serialised sequence state for CPU mode
+        std::vector<uint8_t> cpu_state_data;
+
+        // Separate storage for per-step allocations
+        std::vector<struct ggml_context *>   per_step_ctxs;
+        std::vector<ggml_backend_buffer_t>   per_step_bufs;
+
+        std::vector<struct ggml_context *>   shadow_ctxs;
+        std::vector<ggml_backend_buffer_t>   shadow_bufs;
+
+        bool allocated = false;
+        bool shadow_conv_only = false;
+        bool saved     = false;
+
+        ~gpu_checkpoint() {
+            for (struct ggml_context * ctx : shadow_ctxs) {
+                ggml_free(ctx);
+            }
+            for (ggml_backend_buffer_t buf : shadow_bufs) {
+                ggml_backend_buffer_free(buf);
+            }
+            for (struct ggml_context * ctx : per_step_ctxs) {
+                ggml_free(ctx);
+            }
+            for (ggml_backend_buffer_t buf : per_step_bufs) {
+                ggml_backend_buffer_free(buf);
+            }
+        }
+    };
+
+    gpu_checkpoint ckpt;
+
+    bool checkpoint_alloc_shadows(bool conv_only_shadow = false);
+    bool checkpoint_supported() const;
+    bool checkpoint_save(ggml_backend_sched_t sched);
+    bool checkpoint_restore(ggml_backend_sched_t sched);
+    void checkpoint_delete();
+
+    // Per-step checkpoint: allocate, restore step k's full state (SSM + conv) to cache
+    bool per_step_alloc(const llama_model & model, int max_tokens);
+    bool per_step_restore(const llama_model & model, ggml_backend_sched_t sched, int step);
 
     ~llama_kv_cache() {
         for (struct ggml_context * ctx : ctxs) {
@@ -128,6 +208,7 @@ struct llama_context {
     struct llama_cparams        cparams;
     struct llama_sampling       sampling;
     struct llama_kv_cache       kv_self;
+    struct llama_context      * mtp_target_ctx   = nullptr;
     struct llama_control_vector cvec;
 
     std::vector<float> scale_data;
@@ -166,6 +247,7 @@ struct llama_context {
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
     size_t  output_size = 0; // capacity (of tokens positions) for the output buffers
     int32_t n_outputs   = 0; // number of actually-used outputs in the current ubatch or last logical batch
+    int32_t n_outputs_embd = 0; // number of embedding rows produced for the current logical batch
 
     bool logits_all = false;
 
@@ -193,6 +275,8 @@ struct llama_context {
     void *              abort_callback_data = nullptr;
 
     const float * draft_input_hidden_state = nullptr;
+    size_t draft_input_hidden_state_n_floats = 0;
+    std::vector<float> draft_input_hidden_state_owned;
 
     // input tensors
     struct ggml_tensor * inp_tokens;      // I32 [n_batch]
@@ -218,6 +302,7 @@ struct llama_context {
 
     struct Prev;
     std::unique_ptr<Prev> prev;
+    std::unique_ptr<Prev> prev_mtp;
 
     void reset_scheduler();
     bool can_reuse_graph(const llama_batch & u_batch);
@@ -235,3 +320,4 @@ struct llama_context {
     void set_mtp_op_type(llama_mtp_op_type value);
 
 };
+

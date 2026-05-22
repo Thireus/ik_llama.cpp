@@ -394,6 +394,8 @@ extern "C" {
         int32_t n_v_first;
         int32_t n_v_last;
 
+        enum ggml_type extra_output_type;
+
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 
@@ -462,6 +464,7 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
         enum ggml_type type_reduce; // data type for reduce operations
+        enum ggml_type type_graph_attn; // flash-attn precision under -sm graph
         enum ggml_type type_k_first;
         enum ggml_type type_k_last;
         enum ggml_type type_v_first;
@@ -520,6 +523,7 @@ extern "C" {
         enum ggml_type ffn_down_type;        // feedforward network down type
         enum ggml_type ffn_up_type;          // feedforward network up type
         enum ggml_type ffn_gate_inp_type;    // routed experts probabilities typy (relevant for MoE models only)
+        enum ggml_type extra_output_type;    // routed experts probabilities typy (relevant for MoE models only)
         bool allow_requantize;               // allow quantizing non-f32/f16 tensors
         bool quantize_output_tensor;         // quantize output.weight
         bool only_copy;                      // only copy tensors - ftype, allow_requantize and quantize_output_tensor are ignored
@@ -686,6 +690,13 @@ extern "C" {
 
     LLAMA_API bool llama_model_has_recurrent(const struct llama_model * model);
 
+    // Returns true if the model is a Gemma 4 MTP assistant (external frozen-KV speculative drafter)
+    LLAMA_API bool llama_model_is_gemma4_mtp_assistant(const struct llama_model * model);
+
+    LLAMA_API bool llama_is_gemma4_mtp_file(const char * path);
+
+    LLAMA_API bool llama_model_is_split_mode_graph(const struct llama_model * model);
+
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(
             const char * fname_inp,
@@ -802,6 +813,28 @@ extern "C" {
     // Clear the KV cache - both cell info is erased and KV data is zeroed
     LLAMA_API void llama_kv_cache_clear(
             struct llama_context * ctx);
+
+    // Unified checkpoint API for recurrent/hybrid speculative decoding.
+    enum llama_spec_ckpt_mode {
+        LLAMA_SPEC_CKPT_NONE        = -1,
+        LLAMA_SPEC_CKPT_AUTO        =  0,
+        LLAMA_SPEC_CKPT_PER_STEP    =  1,
+        LLAMA_SPEC_CKPT_GPU_FALLBACK =  2,
+        LLAMA_SPEC_CKPT_CPU         =  3,
+    };
+
+    // Initialise the checkpoint system for the upcoming speculation window.
+    LLAMA_API int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens);
+
+    // Save the current recurrent state as a speculative checkpoint.
+    LLAMA_API bool llama_spec_ckpt_save(struct llama_context * ctx, llama_seq_id seq_id);
+
+    // Restore the recurrent state after speculative decode.
+    LLAMA_API bool llama_spec_ckpt_restore(struct llama_context * ctx, llama_seq_id seq_id,
+                                            llama_pos n_past, int accepted_step);
+
+    // Discard the saved checkpoint and reset internal mode state.
+    LLAMA_API void llama_spec_ckpt_discard(struct llama_context * ctx);
 
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails

@@ -133,7 +133,7 @@ void ggml_backend_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
 }
 
 bool ggml_backend_buffer_is_host(ggml_backend_buffer_t buffer) {
-    return ggml_backend_buft_is_host(ggml_backend_buffer_get_type(buffer));
+    return buffer && ggml_backend_buft_is_host(ggml_backend_buffer_get_type(buffer));
 }
 
 void ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
@@ -1107,7 +1107,8 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #endif
 
 #ifndef GGML_SCHED_MAX_SPLIT_INPUTS
-#define GGML_SCHED_MAX_SPLIT_INPUTS GGML_MAX_SRC
+// Gemma4 with per-layer embeddings and uses up to 32 inputs
+#define GGML_SCHED_MAX_SPLIT_INPUTS 32
 #endif
 
 #ifndef GGML_SCHED_MAX_COPIES
@@ -2696,7 +2697,14 @@ void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct gg
 ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node) {
     int backend_index = tensor_backend_id(node);
     if (backend_index == -1) {
-        return NULL;
+        if (node->buffer && node->buffer->buft) {
+            for (int i = 0; i < sched->n_backends; ++i) {
+                if (sched->backends[i]->iface.get_default_buffer_type(sched->backends[i]) == node->buffer->buft) {
+                    return sched->backends[i];
+                }
+            }
+        }
+        return nullptr;
     }
     return sched->backends[backend_index];
 }

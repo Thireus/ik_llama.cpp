@@ -240,7 +240,7 @@
 // if you need to load more than 64 model shards.
 #define GGML_MAX_CONTEXTS 2048 // Was 64, but I prefer to force it to 2048 on my fork just in case users forget to set -DGGML_MAX_CONTEXTS=2048 at compilation
 #endif
-#define GGML_MAX_SRC            10
+#define GGML_MAX_SRC            12
 #ifndef GGML_MAX_NAME
 #define GGML_MAX_NAME           64
 #endif
@@ -1115,6 +1115,7 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    // Source may be F32, F16, or a supported quantized type; output is always F32.
     GGML_API struct ggml_tensor * ggml_hadamard(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -1268,6 +1269,12 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
+            int                   dim);
+    GGML_API struct ggml_tensor * ggml_concat_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * result,
             int                   dim);
 
     GGML_API struct ggml_tensor * ggml_abs(
@@ -1596,6 +1603,12 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    GGML_API struct ggml_tensor * ggml_mul_mat_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * result);
+
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
     GGML_API void ggml_mul_mat_set_prec(
@@ -1830,6 +1843,16 @@ extern "C" {
             int64_t               ne1,
             int64_t               ne2,
             int64_t               ne3);
+
+    GGML_API struct ggml_tensor * ggml_reshape_4d_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            enum ggml_type        type,
+            int64_t               ne0,
+            int64_t               ne1,
+            int64_t               ne2,
+            int64_t               ne3);
+
 
     // offset in bytes
     GGML_API struct ggml_tensor * ggml_view_1d(
@@ -2448,7 +2471,8 @@ extern "C" {
             struct ggml_tensor  * s,
             struct ggml_tensor  * x,
             struct ggml_tensor  * c,
-            struct ggml_tensor  * sq);
+            struct ggml_tensor  * sq,
+            struct ggml_tensor  * saved_steps);
 
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
@@ -2526,7 +2550,8 @@ extern "C" {
             struct ggml_tensor  * v,
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
-            struct ggml_tensor  * state);
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * saved_steps);
 
     // custom operators
 

@@ -22,6 +22,16 @@ enum slot_command {
     SLOT_COMMAND_RELEASE,
 };
 
+struct server_speculative_checkpoint {
+    bool valid = false;
+    bool per_step_enabled = false; // per-step SSM checkpoints active
+    llama_pos n_past = 0;
+    llama_token sampled = LLAMA_TOKEN_NULL;
+    common_sampler * sampler = nullptr; // saved sampler state
+
+    void clear();
+};
+
 struct server_slot {
     int id;
     int id_task = -1;
@@ -126,6 +136,7 @@ struct server_slot {
     // sampling
     llama_token sampled; // in speculative mode, this is the last accepted token
     llama_tokens drafted;
+    common_speculative_type drafted_spec_type = COMMON_SPECULATIVE_TYPE_NONE;
 
     json json_schema;
 
@@ -157,8 +168,13 @@ struct server_slot {
     struct common_params_sampling sparams;
     common_sampler * ctx_sampling = nullptr;
 
+    // expiring logit bias
+    decltype(ctx_sampling->elb_states) elb_prev_states;
+
     bool has_mtp = false;
-    std::vector<float> mtp_hidden_state;
+
+    // saves recurrent state before a speculative batch so it can be restored on rejection
+    server_speculative_checkpoint spec_ckpt;
 
     // speculative decoding stats
     int32_t n_draft_total = 0;      // Total draft tokens generated
@@ -237,10 +253,11 @@ struct server_context {
     std::vector<control_vector_container> control_vectors;
 
     std::vector<std::string> vocab_pieces;
+    size_t max_piece_len = 0;
 
     gpt_params params_base;
 
-    llama_batch batch;
+    llama_batch batch = {};
 
     bool clean_kv_cache = true;
     bool add_bos_token = true;
