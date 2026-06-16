@@ -26,10 +26,13 @@ struct llama_hparams {
     uint32_t n_layer;
     int32_t n_layer_kv_from_start = -1; // if non-negative, the first n_layer_kv_from_start layers have KV cache
     uint32_t n_rot;
+    uint32_t n_rot_swa;
     uint32_t n_swa = 0; // sliding window attention (SWA)
     uint32_t n_swa_pattern = 1; // by default, all layers use non-sliding-window attention
-    uint32_t n_embd_head_k; // dimension of keys (d_k). d_q is assumed to be the same, but there are n_head q heads, and only n_head_kv k-v heads
-    uint32_t n_embd_head_v; // dimension of values (d_v) aka n_embd_head
+    uint32_t n_embd_head_k_full; // dimension of keys (d_k). d_q is assumed to be the same, but there are n_head q heads, and only n_head_kv k-v heads
+    uint32_t n_embd_head_v_full; // dimension of values (d_v) aka n_embd_head
+    uint32_t n_embd_head_k_swa;
+    uint32_t n_embd_head_v_swa;
     uint32_t n_expert = 0;
     uint32_t n_expert_used = 0;
     uint32_t n_vocab_type = 0; // for BERT-style token types
@@ -79,7 +82,6 @@ struct llama_hparams {
     float    yarn_attn_factor =  1.0f;
     float    yarn_beta_fast   = 32.0f;
     float    yarn_beta_slow   =  1.0f;
-
     std::array<int, 4> rope_sections;
     std::array<float,    LLAMA_MAX_LAYERS> rope_freq_base_per_layer;
     std::array<uint32_t, LLAMA_MAX_LAYERS> rope_dim_per_layer;
@@ -102,6 +104,7 @@ struct llama_hparams {
     float f_residual_scale  = 0.0f;
     float f_embedding_scale = 0.0f;
     float f_attention_scale = 0.0f;
+    float f_attn_v_scale    = 1.0f;
 
     // grok-2
     float    f_attn_out_scale = 0.0f;
@@ -127,6 +130,15 @@ struct llama_hparams {
 	// qwen3vl deepstack
     uint32_t n_deepstack_layers = 0;
 
+    // gemma4 per-layer embedding
+    uint32_t n_embd_per_layer = 0;
+
+    // gemma4 separate assistant MTP
+    uint32_t mtp_backbone_n_embd = 0;
+    bool     mtp_use_ordered_embeddings = false;
+    uint32_t mtp_num_centroids = 0;
+    uint32_t mtp_centroid_top_k = 0;
+
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggerganov/llama.cpp/pull/8141
     llama_token dec_start_token_id = -1;
@@ -145,12 +157,13 @@ struct llama_hparams {
         if (this->n_vocab       != other.n_vocab)       return true;
         if (this->n_ctx_train   != other.n_ctx_train)   return true;
         if (this->n_embd        != other.n_embd)        return true;
+        if (this->mtp_backbone_n_embd != other.mtp_backbone_n_embd) return true;
         if (this->n_layer       != other.n_layer)       return true;
         if (this->n_rot         != other.n_rot)         return true;
         if (this->n_swa         != other.n_swa)         return true;
         if (this->n_swa_pattern != other.n_swa_pattern) return false;
-        if (this->n_embd_head_k != other.n_embd_head_k) return true;
-        if (this->n_embd_head_v != other.n_embd_head_v) return true;
+        if (this->n_embd_head_k_full != other.n_embd_head_k_full) return true;
+        if (this->n_embd_head_v_full != other.n_embd_head_v_full) return true;
         if (this->n_expert      != other.n_expert)      return true;
         if (this->n_expert_used != other.n_expert_used) return true;
 
@@ -192,6 +205,10 @@ struct llama_hparams {
         if (!is_float_close(this->f_attention_scale,     other.f_attention_scale,     EPSILON)) return true;
 
         return false;
+    }
+
+    bool has_kv(uint32_t il) const {
+        return n_layer_kv_from_start > 0 ? il < n_layer_kv_from_start : true;
     }
 
     uint32_t n_head(uint32_t il = 0) const {
@@ -239,16 +256,16 @@ struct llama_hparams {
         return n_head/n_head_kv;
     }
 
-    uint32_t n_embd_k_gqa(uint32_t il = 0) const { // dimension of key embeddings across all k-v heads
-        const uint32_t n_head_kv = this->n_head_kv(il);
+    uint32_t n_embd_head_k(int il) const { return swa_layers[il] ? n_embd_head_k_swa : n_embd_head_k_full; }
 
-        return n_embd_head_k * n_head_kv;
+    uint32_t n_embd_head_v(int il) const { return swa_layers[il] ? n_embd_head_v_swa : n_embd_head_v_full; }
+
+    uint32_t n_embd_k_gqa(uint32_t il = 0) const { // dimension of key embeddings across all k-v heads
+        return n_head_kv(il) * n_embd_head_k(il);
     }
 
     uint32_t n_embd_v_gqa(uint32_t il = 0) const { // dimension of value embeddings across all k-v heads
-        const uint32_t n_head_kv = this->n_head_kv(il);
-
-        return n_embd_head_v * n_head_kv;
+        return n_head_kv(il) * n_embd_head_v(il);
     }
 
     uint32_t n_embd_k_s() const { // dimension of the rolling state embeddings
@@ -279,8 +296,8 @@ struct llama_hparams {
         return ssm_d_state * ssm_d_inner;
     }
 
-    uint32_t n_embd_v_s_id(int nv) const {
-        if (ssm_n_group <= 0 || nv < 1 || ssm_dt_rank < 1) return 0;
+    std::pair<uint32_t, uint32_t> n_embd_v_s_dims(int nv) const {
+        if (ssm_n_group <= 0 || nv < 1 || ssm_dt_rank < 1) return {0, 0};
         int num_v_heads = ssm_dt_rank;
         int num_k_heads = ssm_n_group;
         int gqa_ratio   = num_v_heads / num_k_heads;
@@ -290,10 +307,16 @@ struct llama_hparams {
         int head_k_dim  = ssm_d_state;
         int head_v_dim  = ssm_d_inner / num_v_heads;
         uint32_t conv_dim       = 2 * nk * head_k_dim + nv * head_v_dim;
-        uint32_t conv_state_dim = conv_dim * (ssm_d_conv - 1);
+        //uint32_t conv_state_dim = conv_dim * (ssm_d_conv - 1);
+        //uint32_t ssm_state_dim  = head_v_dim * head_v_dim * nv;
+        //return {conv_state_dim, ssm_state_dim};
         uint32_t ssm_state_dim  = head_v_dim * head_v_dim * nv;
-        return conv_state_dim + ssm_state_dim;
+        return {conv_dim, ssm_state_dim};
+    }
 
+    uint32_t n_embd_v_s_id(int nv) const {
+        auto [conv_dim, ssm_state_dim] = n_embd_v_s_dims(nv);
+        return (ssm_d_conv - 1) * conv_dim + ssm_state_dim;
     }
 
     bool is_recurrent(uint32_t il) const {
@@ -322,7 +345,7 @@ struct llama_hparams {
 
     uint32_t rope_n_rot(uint32_t il) const {
         const uint32_t v = rope_dim_per_layer[il];
-        return v ? v : n_rot;
+        return v ? v : swa_layers[il] ? n_rot_swa : n_rot;
     }
 
     static const char * rope_scaling_type_name(llama_rope_scaling_type);

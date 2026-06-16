@@ -332,6 +332,84 @@ struct fattn_mma_f16_config<192, 192> {
     }
 };
 
+//template <>
+//struct fattn_mma_f16_config<512, 512> {
+//    static constexpr int  nbatch_fa      = 64;
+//    static constexpr int  nwarps_max     = 4;
+//    static constexpr bool Q_in_reg       = false;
+//    static constexpr int  nstages_target = 1;
+//
+//    static int get_nbatch_K2_host([[maybe_unused]] const int cc, [[maybe_unused]] const int ncols) {
+//        return 256;
+//    }
+//
+//    static constexpr __device__ int get_nbatch_K2_device([[maybe_unused]] int ncols) {
+//        return 256;
+//    }
+//
+//    static int get_nbatch_V2_host([[maybe_unused]] const int cc, [[maybe_unused]] const int ncols) {
+//        return 256;
+//    }
+//
+//    static constexpr __device__ int get_nbatch_V2_device([[maybe_unused]] int ncols) {
+//        return 256;
+//    }
+//
+//    static int get_nbatch_combine_host(const int /*cc*/, const int /*ncols*/) {
+//        return 256;
+//    }
+//
+//    static constexpr __device__ int get_nbatch_combine_device(int /*ncols*/) {
+//        return 256;
+//    }
+//};
+
+template <>
+struct fattn_mma_f16_config<512, 512> {
+    static constexpr int  nbatch_fa      = 32;
+    static constexpr int  nwarps_max     = 8;
+    static constexpr bool Q_in_reg       = false;
+    static constexpr int  nstages_target = 1;
+
+    static int get_nbatch_K2_host(const int cc, const int ncols) {
+        if (ggml_cuda_highest_compiled_arch(cc) == CC_TURING) {
+            return ncols <= 16 ? 96 : 128;
+        }
+        return ncols <= 16 ? 256 : 128;
+    }
+
+    static constexpr __device__ int get_nbatch_K2_device(int ncols) {
+#if __CUDA_ARCH__ == CC_TURING
+        return ncols <= 16 ? 96 : 128;
+#else
+        return ncols <= 16 ? 256 : 128;
+#endif // __CUDA_ARCH__ == CC_TURING
+    }
+
+    static int get_nbatch_V2_host(const int cc, const int ncols) {
+        if (ggml_cuda_highest_compiled_arch(cc) == CC_TURING) {
+            return ncols <= 16 ? 64 : 128;
+        }
+        return ncols <= 16 ? 256 : 128;
+    }
+
+    static constexpr __device__ int get_nbatch_V2_device(int ncols) {
+#if __CUDA_ARCH__ == CC_TURING
+        return ncols <= 16 ? 64 : 128;
+#else
+        return ncols <= 16 ? 256 : 128;
+#endif // __CUDA_ARCH__ == CC_TURING
+    }
+
+    static int get_nbatch_combine_host(const int /*cc*/, const int /*ncols*/) {
+        return 128;
+    }
+
+    static constexpr __device__ int get_nbatch_combine_device(int /*ncols*/) {
+        return 128;
+    }
+};
+
 template <>
 struct fattn_mma_f16_config<576, 512> {
     static constexpr int  nbatch_fa      = 32;
@@ -1769,7 +1847,7 @@ static __global__ void flash_attn_mask_to_KV_max(
     }
 }
 
-template <int DV, int ncols1, int ncols2>
+template <int DV, int ncols1, int ncols2, bool is_mla = false>
 static void launch_fattn_new_mma(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_new_mma_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int KQ_row_granularity, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
@@ -1841,7 +1919,7 @@ static void launch_fattn_new_mma(
     }
 
     if (need_f16_V && V->type != GGML_TYPE_F16) {
-        if constexpr (DV == 512) {
+        if constexpr (is_mla) {
             // DeepSeek. In this case the V cache is the same as the K cache, except that
             //           it has 512 elements per row instead of 576.
             nb21 = nb11;
@@ -2025,13 +2103,14 @@ static void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ct
     const int nstages = cp_async_available(cc) ? c::nstages_target : 0;
 
     constexpr int ncols         = ncols1 * ncols2;
-    constexpr int ntiles        = ncols <= 8 && DKQ < 576 ? 1 : 2; // Number of tiles per warp.
+    //constexpr int ntiles        = DKQ == 512 ? 2 : ncols <= 8 && DKQ < 576 ? 1 : 2; // Number of tiles per warp.
+    constexpr int ntiles        = ncols <= 8 && DKQ < 512 ? 1 : 2; // Number of tiles per warp.
     constexpr int cols_per_warp = ntiles * tile_B::I;
     constexpr int nwarps_max_x  = (ncols + cols_per_warp - 1) / cols_per_warp;
     constexpr int nwarps_max_y  = c::nbatch_fa / tile_A::I;
     constexpr int nwarps        = nwarps_max_x*nwarps_max_y <= c::nwarps_max ? nwarps_max_x*nwarps_max_y : c::nwarps_max;
 
-    constexpr bool mla = DKQ == 576 || DKQ == 320;
+    constexpr bool is_mla = (DKQ == 576 && DV == 512) || (DKQ == 320 && DV == 256);
 
     const int nbatch_K2      = c::get_nbatch_K2_host     (cc, ncols);
     const int nbatch_V2      = c::get_nbatch_K2_host     (cc, ncols);
@@ -2059,7 +2138,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ct
     fattn_new_mma_kernel_t fattn_kernel;
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, nwarps, ntiles, use_logit_softcap, mla>;
+        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, nwarps, ntiles, use_logit_softcap, is_mla>;
 
 #if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
@@ -2070,7 +2149,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ct
 #endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && !defined(GGML_USE_MUSA)
     } else {
         constexpr bool use_logit_softcap = true;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, nwarps, ntiles, use_logit_softcap, mla>;
+        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, nwarps, ntiles, use_logit_softcap, is_mla>;
 
 #if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
@@ -2081,7 +2160,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ct
 #endif // !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)) && !defined(GGML_USE_MUSA)
     }
 
-    launch_fattn_new_mma<DV, ncols1, ncols2>
+    launch_fattn_new_mma<DV, ncols1, ncols2, is_mla>
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, FATTN_KQ_STRIDE, true, true, true);
 }
 
@@ -2089,15 +2168,27 @@ template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
 
-    if constexpr (DKQ == 576 && ncols2 <= 4) {
+    if constexpr (DKQ == 512 && ncols2 == 2) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8, ncols2>(ctx, dst);
+    }
+    else if constexpr ((DKQ == 576 || DKQ == 512) && ncols2 <= 4) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 4, ncols2>(ctx, dst);
     } else {
 
     if constexpr (ncols2 <= 8) {
+        //if constexpr (DKQ == 512) {
+        //    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 2, ncols2>(ctx, dst);
+        //    return;
+        //} else {
         if (Q->ne[1] <= 8/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
+            if constexpr (DKQ == 512 || DKQ == 576) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 2, ncols2>(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
+            }
             return;
         }
+        //}
     }
 
     if (Q->ne[1] <= 16/ncols2) {
@@ -2105,12 +2196,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         return;
     }
 
-    if (Q->ne[1] <= 32/ncols2) {
+    if (Q->ne[1] <= 32/ncols2 || (DKQ == 512 && ncols2 == 16)) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
         return;
     }
-
-    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
+    if constexpr (DKQ == 512) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 4, ncols2>(ctx, dst);
+    } else {
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
+    }
     }
 }
 
@@ -2209,6 +2303,30 @@ void ggml_cuda_flash_attn_ext_mma_new(ggml_backend_cuda_context & ctx, ggml_tens
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<320, 256, 16>(ctx, dst);
         return;
     }
+    if (Q->ne[0] == 512 && K->ne[0] == 512 && V->ne[0] == 512) {
+        // head_dim 512: ncols2=16 exceeds the max dynamic shared memory on some GPUs (e.g. Ada,
+        // where cudaFuncSetAttribute returns invalid argument), so route gqa_ratio % 8 == 0
+        // (covers 8 and 16) through the ncols2=8 kernel. It iterates over Q-head groups
+        // (iter_z = ceil(gqa_ratio/ncols2)), so 16 heads run as two passes of 8. This unblocks
+        // head_dim-512 models with a 16:1 GQA ratio such as Gemma 4 12B's global layers.
+        if (gqa_ratio % 16 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<512, 512, 16>(ctx, dst);
+        }
+        else if (gqa_ratio % 8 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<512, 512, 8>(ctx, dst);
+        }
+        else if (gqa_ratio % 4 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<512, 512, 4>(ctx, dst);
+        }
+        else if (gqa_ratio % 2 == 0) {
+            // Gemma4-4B assistant
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<512, 512, 2>(ctx, dst);
+        }
+        else {
+            GGML_ABORT("Fatal error");
+        }
+        return;
+    }
     GGML_ASSERT(Q->ne[0] == 576 && K->ne[0] == 576 && V->ne[0] == 512);
     if (gqa_ratio == 20 && Q->ne[1] <= 4 && K->ne[1] >= 2048) {
         if (ggml_cuda_info().devices[ctx.device].cc >= CC_ADA_LOVELACE) {
@@ -2218,8 +2336,14 @@ void ggml_cuda_flash_attn_ext_mma_new(ggml_backend_cuda_context & ctx, ggml_tens
         }
         return;
     }
+    if (gqa_ratio % 12 == 0 && Q->ne[1] <= 4 && K->ne[1] >= 2048) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<576, 512, 1, 16>(ctx, dst);
+        return;
+    }
     if (gqa_ratio % 16 == 0) {
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512, 16>(ctx, dst);
+    } else if (gqa_ratio % 8 == 0) {
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512, 8>(ctx, dst);
     } else if (gqa_ratio % 4 == 0) {
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512, 4>(ctx, dst);
     } else {

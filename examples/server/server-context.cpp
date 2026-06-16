@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-chat.h"
 #include "server-common.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -11,12 +12,142 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include <fstream>
+#include <iostream>
 #include <regex>
+#include <exception>
+
+static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, llama_context * ctx, int id, int64_t n_tokens, llama_pos pos_min = -1, llama_pos pos_max = -1, int32_t offset = 0) {
+    if (pos_min == -1) {
+        pos_min = llama_kv_cache_seq_pos_min(ctx, id);
+    }
+    if (pos_max == -1) {
+        pos_max = llama_kv_cache_seq_pos_max(ctx, id);
+    }
+    const size_t checkpoint_size = llama_state_seq_get_size(ctx, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+    ckpt.pos_min = pos_min;
+    ckpt.pos_max = pos_max;
+    ckpt.pos_max_prompt = pos_max + offset;
+    ckpt.pos_min_prompt = pos_min + offset;
+    ckpt.n_tokens = n_tokens;
+    ckpt.data.resize(checkpoint_size);
+
+    const size_t n = llama_state_seq_get_data(ctx, ckpt.data.data(), checkpoint_size, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    if (n != checkpoint_size) {
+        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", checkpoint_size, n);
+    }
+}
 
 static void log_text(const gpt_params & params_base, const std::string & text) {
     if (params_base.minilog) {
         LOG_TEE("%s\n", text.c_str());
     }
+}
+
+struct server_mtp_warmup {
+    llama_context * ctx_tgt;
+    server_slot   * slot;
+};
+
+static int32_t server_mtp_media_warmup_callback(void * user_data, const llama_batch * batch) {
+    auto * data = static_cast<server_mtp_warmup *>(user_data);
+    if (data == nullptr || data->slot == nullptr) {
+        return 0;
+    }
+
+    return batch != nullptr
+        ? common_speculative_on_target_seq_batch(data->slot->spec, data->ctx_tgt, *batch, data->slot->id, true)
+        : 0;
+}
+
+static bool server_response_needs_chat_parse(oaicompat_type oaicompat) {
+    return oaicompat == OAICOMPAT_TYPE_CHAT ||
+        oaicompat == OAICOMPAT_TYPE_ANTHROPIC ||
+        oaicompat == OAICOMPAT_TYPE_RESP;
+}
+
+static bool server_speculative_same_stage_types(
+        const common_params_speculative & lhs,
+        const common_params_speculative & rhs) {
+    const auto lhs_stages = lhs.get_resolved_stages();
+    const auto rhs_stages = rhs.get_resolved_stages();
+
+    if (lhs_stages.size() != rhs_stages.size()) {
+        return false;
+    }
+
+    for (size_t i = 0; i < lhs_stages.size(); ++i) {
+        if (lhs_stages[i].type != rhs_stages[i].type) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static void server_reject_dead_speculative_request_overrides(const json & data) {
+    if (json_value_ptr(data, "speculative.type") != nullptr) {
+        throw std::runtime_error("Error: speculative.type request override is not supported; keep the startup stage types and use speculative.stages or speculative.n_max/n_min/p_min");
+    }
+
+    if (json_value_ptr(data, "speculative.ngram_size_n") != nullptr ||
+        json_value_ptr(data, "speculative.ngram_size_m") != nullptr ||
+        json_value_ptr(data, "speculative.ngram_min_hits") != nullptr ||
+        json_value_ptr(data, "speculative.suffix_min_match_len") != nullptr ||
+        json_value_ptr(data, "speculative.suffix_max_depth") != nullptr ||
+        json_value_ptr(data, "speculative.suffix_corpus") != nullptr) {
+        throw std::runtime_error("Error: structural speculative overrides are startup-only; per-request overrides only support speculative.n_max, speculative.n_min, speculative.p_min, and speculative.stages");
+    }
+}
+
+static common_speculative_stage_params server_parse_speculative_stage_json(const json & stage_json) {
+    if (!stage_json.is_object()) {
+        throw std::runtime_error("Error: speculative.stages entries must be objects");
+    }
+    if (!stage_json.contains("type") || !stage_json["type"].is_string()) {
+        throw std::runtime_error("Error: speculative.stages entries must include a string 'type'");
+    }
+
+    common_speculative_stage_params stage;
+    stage.type = common_speculative_type_from_name(stage_json["type"].get<std::string>());
+    if (stage.type == COMMON_SPECULATIVE_TYPE_COUNT) {
+        throw std::runtime_error("Error: unknown speculative stage type in speculative.stages");
+    }
+
+    for (const auto & item : stage_json.items()) {
+        if (item.key() == "type") {
+            continue;
+        }
+
+        if (item.key() == "n_max") {
+            stage.n_max = item.value().get<int32_t>();
+            if (stage.n_max < 0) {
+                throw std::runtime_error("Error: speculative.stages[].n_max must be >= 0");
+            }
+            continue;
+        }
+
+        if (item.key() == "n_min") {
+            stage.n_min = item.value().get<int32_t>();
+            if (stage.n_min < 0) {
+                throw std::runtime_error("Error: speculative.stages[].n_min must be >= 0");
+            }
+            continue;
+        }
+
+        if (item.key() == "p_min") {
+            stage.p_min = item.value().get<float>();
+            if (stage.p_min < 0.0f) {
+                throw std::runtime_error("Error: speculative.stages[].p_min must be >= 0");
+            }
+            continue;
+        }
+
+        throw std::runtime_error("Error: per-request speculative.stages only support type, n_max, n_min, and p_min; structural stage overrides are startup-only");
+    }
+
+    return stage;
 }
 
 server_context::~server_context() {
@@ -31,27 +162,16 @@ server_context::~server_context() {
     }
     // Free multimodal
     mtmd_free(mctx);
-    // Free draft model and context if they exist
-    if (ctx_draft) {
-        llama_free(ctx_draft);
-        ctx_draft = nullptr;
-    }
-    if (model_draft) {
-        llama_free_model(model_draft);
-        model_draft = nullptr;
-    }
 
     // Clear any sampling context
     for (server_slot& slot : slots) {
         if (slot.ctx_sampling != nullptr) {
             common_sampler_free(slot.ctx_sampling);
         }
-        if (slot.ctx_dft) {
-            llama_free(slot.ctx_dft);
-        }
         common_speculative_free(slot.spec);
-        llama_batch_free(slot.batch_spec);
     }
+
+    params_base.speculative.clear_dft();
 
     llama_batch_free(batch);
 }
@@ -75,23 +195,27 @@ bool server_context::load_model(const gpt_params& params_) {
     add_bos_token = llama_should_add_bos_token(model);
     has_eos_token = llama_add_eos_token(model) != 1;
 
-    bool has_draft_model = !params_base.speculative.model.empty() || !params_base.speculative.params.empty();
-    std::string& mmproj_path = params_base.mmproj.path;
+    common_speculative_prepare_startup(params_base, false);
+
+    const bool has_draft_model = params_base.speculative.has_dft();
+    std::string & mmproj_path = params_base.mmproj.path;
     if (!mmproj_path.empty()) {
         mtmd_context_params mparams = mtmd_context_params_default();
         mparams.use_gpu = params_base.mmproj_use_gpu;
         mparams.print_timings = false;
-        mparams.n_threads = params_base.n_threads;
+        mparams.n_threads = params_base.n_threads_mtmd != -1 ? params_base.n_threads_mtmd
+                             : params_base.n_threads_batch != -1 ? params_base.n_threads_batch
+                                                                 : params_base.n_threads;
         mparams.flash_attn_type = params_base.flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
         mparams.verbosity = params_base.verbosity > 0 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_INFO;
         mparams.image_min_tokens = params_base.image_min_tokens;
         mparams.image_max_tokens = params_base.image_max_tokens;
         mctx = mtmd_init_from_file(mmproj_path.c_str(), model, mparams);
         if (mctx == nullptr) {
-            LOG_ERROR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
+            LOG_ERROR("failed to load multimodal model, %s\n", mmproj_path.c_str());
             return false;
         }
-        LOG_INFO("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+        LOG_INFO("loaded multimodal model, %s\n", mmproj_path.c_str());
 
         //if (params.n_cache_reuse) {
         //    params_base.n_cache_reuse = 0;
@@ -102,60 +226,22 @@ bool server_context::load_model(const gpt_params& params_) {
             LOG_ERROR("%s\n", "err: speculative decode is not supported by multimodal");
             return false;
         }
-        if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
+
+        const auto spec_stages = params_base.speculative.get_resolved_stages();
+        const bool multimodal_spec_supported = spec_stages.empty() ||
+            (spec_stages.size() == 1 && spec_stages.front().type == COMMON_SPECULATIVE_TYPE_MTP);
+        if (!multimodal_spec_supported) {
             params_base.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
+            params_base.speculative.stages.clear();
+            params_base.has_mtp = false;
             SRV_WRN("%s\n", "speculative decoding is not supported by multimodal, it will be disabled");
         }
     }
-    // Load draft model for speculative decoding if specified
-    if (has_draft_model) {
-        LLAMA_LOG_INFO("\n\n==================================loading DRAFT model==================================\n\n");
 
-        gpt_params params_dft;
-        params_dft.devices      = params_base.speculative.devices;
-        params_dft.model        = params_base.speculative.model;
-        params_dft.n_gpu_layers = params_base.speculative.n_gpu_layers;
-        params_dft.rpc_servers  = params_base.rpc_servers;
-        params_dft.cache_type_k = params_base.speculative.cache_type_k.empty() ? params_base.cache_type_k : params_base.speculative.cache_type_k;
-        params_dft.cache_type_v = params_base.speculative.cache_type_v.empty() ? params_base.cache_type_v : params_base.speculative.cache_type_v;
-        params_dft.flash_attn   = params_base.flash_attn;
-        if (!params_base.speculative.params.empty()) {
-            auto [argc, argv] = parse_command_line("llama-server " + params_base.speculative.params);
-            if (!gpt_params_parse(argc, argv, params_dft)) {
-                gpt_params_print_usage(argc, argv, params_dft);
-                free_command_line(argc, argv);
-                return false;
-            };
-            free_command_line(argc, argv);
-        }
-        LOG_INFO("", { {"model", params_dft.model} });
-        if (params_dft.n_ctx == 0) {
-            params_dft.n_ctx = params_base.speculative.n_ctx;
-        }
-        params_dft.n_ctx = params_dft.n_ctx == 0 ? params_base.n_ctx / params_base.n_parallel : params_dft.n_ctx;
-        params_dft.n_parallel = 1;
-        params_dft.n_batch = params_dft.n_ctx;
-
-        params_base.speculative.mparams_dft.path = params_dft.model; //
-
-        llama_model_params mparams_dft = common_model_params_to_llama(params_dft);
-
-        llama_model * model_dft = llama_model_load_from_file(params_dft.model.c_str(), mparams_dft);
-        if (model_dft == nullptr) {
-            LOG_ERROR("failed to load draft model", { {"model", params_base.speculative.model} });
-            return false;
-        }
-
-        cparams_dft = common_context_params_to_llama(params_dft);
-
-        params_base.speculative.model_dft = model_dft;
-        params_base.speculative.cparams_dft = cparams_dft;
-
+    if (!common_speculative_finalize_startup(params_base, model)) {
+        return false;
     }
-    else if (params_base.has_mtp && llama_model_n_nextn_layer(model) == 0) {
-        LOG_WARNING("WARNING: -mtp flag provided, but model has 0 NextN layers. MTP will be disabled.\n", {});
-        params_base.has_mtp = false;
-    }
+
     return true;
 }
 
@@ -163,6 +249,20 @@ void server_context::init() {
     const int32_t n_ctx_slot = n_ctx / params_base.n_parallel;
 
     LOG_INFO("initializing slots", { {"n_slots", params_base.n_parallel} });
+
+    if (params_base.has_mtp) {
+        SRV_INF("%s\n", "MTP needs embeddings on decode, enabling");
+        llama_set_embeddings(ctx, true);
+    }
+
+    const bool requested_spec = params_base.speculative.has_stage_chain();
+    bool can_spec = true;
+    if (!params_base.dry_run) {
+        can_spec = common_speculative_is_compat(ctx);
+    }
+    if (!can_spec && requested_spec) {
+        SRV_WRN("%s", "speculative decoding not supported by this context\n");
+    }
 
     for (int i = 0; i < params_base.n_parallel; i++) {
         server_slot slot;
@@ -205,52 +305,30 @@ void server_context::init() {
         slot.ga_n = ga_n;
         slot.ga_w = ga_w;
 
+        slot.params.speculative = params_base.speculative;
         slot.sparams = params_base.sparams;
 
-        if (params_base.has_mtp) {
-            if (llama_model_n_nextn_layer(model) > 0) {
-                params_base.speculative.type = COMMON_SPECULATIVE_TYPE_MTP;
-                params_base.pooling_type = LLAMA_POOLING_TYPE_NONE;
-
-                slot.has_mtp = true;
-                slot.params.speculative.type = COMMON_SPECULATIVE_TYPE_MTP;
-                slot.params.speculative.n_min = 0;
-
-                slot.batch_spec = llama_batch_init(slot.params.speculative.n_max + 1, 0, 1);
-                SLT_DBG(slot, "batch_spec contains %d tokens\n", slot.batch_spec.n_tokens);
-
-                SRV_INF("%s\n", "MTP needs embeddings on decode, enabling");
-                llama_set_embeddings(ctx, true);
-            }
-            else {
-                SRV_WRN("%s\n", "MTP enabled via flag, but model has 0 NextN layers. Disabling speculative.");
-                params_base.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
-                slot.has_mtp = false;
-            }
-        }
-
-        bool can_spec = true;
-        if (!params_base.dry_run) {
-            can_spec = common_speculative_is_compat(ctx);
-        }  
-        if (!can_spec) {
-            SRV_WRN("%s", "speculative decoding not supported by this context\n");
-        }
         // try speculative decoding
-        if (can_spec) {
-            slot.spec = common_speculative_init(params_base.speculative, slot.ctx);
-            if (slot.spec) {
-                if (mctx) {
+        if (can_spec && requested_spec) {
+            switch (common_speculative_try_init(params_base.speculative, slot.ctx, &slot.spec)) {
+            case COMMON_SPECULATIVE_INIT_READY:
+                if (mctx && !slot.uses_mtp()) {
                     SRV_ERR("%s\n", "speculative decoding is not supported with multimodal");
                     return;
                 }
                 SLT_INF(slot, "%s", "speculative decoding context initialized\n");
-            } else {
-                if (slot.has_mtp) {
-                    SRV_ERR("%s", "failed to initialize MTP speculative context\n");
-                } else {
-                    SLT_INF(slot, "%s", "speculative decoding context not initialized\n");
-                }
+                break;
+            case COMMON_SPECULATIVE_INIT_ERR_RECURRENT:
+                SRV_ERR("%s", "failed to initialize recurrent speculative context\n");
+                throw std::runtime_error("recurrent speculative context initialization failed");
+            case COMMON_SPECULATIVE_INIT_ERR_MTP:
+                SRV_ERR("%s", "failed to initialize MTP speculative context\n");
+                throw std::runtime_error("MTP speculative context initialization failed");
+            case COMMON_SPECULATIVE_INIT_ERR_GENERIC:
+                SRV_ERR("%s", "failed to initialize speculative decoding context\n");
+                throw std::runtime_error("speculative decoding context initialization failed");
+            case COMMON_SPECULATIVE_INIT_SKIPPED:
+                break;
             }
         }
 
@@ -306,14 +384,13 @@ void server_context::init() {
         }
 
         // thinking is enabled if:
-        // 1. It's not explicitly disabled (reasoning_budget == 0)
-        // 2. The chat template supports it
-        const bool enable_thinking = params_base.use_jinja && params_base.reasoning_budget != 0 && common_chat_templates_support_enable_thinking(chat_templates.get());
-        SRV_INF("%s: chat template, thinking = %d\n", __func__, enable_thinking);
+            // 1. It's not explicitly disabled via --reasoning off
+            // 2. The chat template supports it
+        const bool template_supports_thinking = params_base.use_jinja && common_chat_templates_support_enable_thinking(chat_templates.get());
+        const bool enable_thinking = params_base.enable_reasoning != 0 && template_supports_thinking;
 
         chat_params = {
             /* use_jinja             */ params_base.use_jinja,
-            /* use_peg               */ params_base.use_peg,
             /* prefill_assistant     */ params_base.prefill_assistant,
             /* reasoning_format      */ params_base.reasoning_format,
             /* chat_template_kwargs  */ params_base.default_template_kwargs,
@@ -321,6 +398,10 @@ void server_context::init() {
             /* allow_image           */ mctx ? mtmd_support_vision(mctx) : false,
             /* allow_audio           */ mctx ? mtmd_support_audio(mctx) : false,
             /* enable_thinking       */ enable_thinking,
+            /* parallel_tool_calls  */ params_base.parallel_tool_calls,
+            /* reasoning_budget      */ params_base.reasoning_budget,
+            /* reasoning_budget_msg  */ params_base.reasoning_budget_message,
+            /* force_pure_content    */ params_base.force_pure_content_parser
            // /* media_path            */ params_base.media_path,
         };
     }
@@ -353,6 +434,7 @@ void server_slot::prompt_load(server_prompt_cache& prompt_cache, const server_to
 
 void server_slot::reset() {
     n_prompt_tokens = 0;
+    last_gentxt_size = 0;
     generated_text = "";
     truncated = false;
     stopped_eos = false;
@@ -361,6 +443,8 @@ void server_slot::reset() {
     stopping_word = "";
     n_past = 0;
     n_past_prompt = 0;
+    n_discarded_prompt = 0;
+    n_kept_prompt = 0;
     n_sent_text = 0;
     drafted.clear();
     i_batch_dft.clear();
@@ -380,11 +464,20 @@ void server_slot::reset() {
     checkpoint_pos = 0;
     image_just_processed = false;
     do_checkpoint = false;
+    if (spec != nullptr) {
+        common_speculative_clear_sequence(spec, id);
+    }
 
     positional_bans.clear();
     ban_phrases.clear();
     ban_regex.clear();
     ban_regex_ci.clear();
+
+    allow_ruless.clear();
+    allow_pieces.clear();
+    allow_kws.clear();
+    allow_kw_delay = 0;
+    allow_idx = 0;
 
     // Reset speculative decoding stats
     n_draft_total = 0;
@@ -392,6 +485,9 @@ void server_slot::reset() {
     chat_msg = {};
     json_schema = json();
     generated_tool_call_ids.clear();
+
+    anthropic_thinking_block_started = false;
+    anthropic_text_block_started = false;
 
     oai_resp_thinking_block_started = false;
     oai_resp_text_block_started = false;
@@ -404,7 +500,11 @@ void server_slot::reset() {
 }
 
 bool server_slot::need_embd() const {
-    return embedding || has_mtp;
+    return embedding || uses_mtp();
+}
+
+bool server_slot::uses_mtp() const {
+    return params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
 }
 
 bool server_slot::has_budget(gpt_params& global_params) {
@@ -440,7 +540,7 @@ void server_slot::add_token_string(const completion_token_output& token) {
 }
 
 bool server_slot::can_speculate() const {
-    return (!!spec || has_mtp);
+    return (!!spec || uses_mtp());
 }
 
 int server_slot::get_n_draft_max() const {
@@ -449,7 +549,7 @@ int server_slot::get_n_draft_max() const {
     }
 
     // determine the max draft that fits the current slot state
-    int n_draft_max = params.speculative.n_max;
+    int n_draft_max = params.speculative.get_max_stage_n_max();
 
     // note: slot.prompt is not yet expanded with the `id` token sampled above
     //       also, need to leave space for 1 extra token to allow context shifts
@@ -461,8 +561,9 @@ int server_slot::get_n_draft_max() const {
 
     SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
-    if (n_draft_max < params.speculative.n_min) {
-        SLT_DBG(*this, "the max possible draft is too small: %d < %d - skipping speculative decoding\n", n_draft_max, params.speculative.n_min);
+    const int min_usable_draft = params.speculative.get_min_usable_stage_n_min();
+    if (n_draft_max < min_usable_draft) {
+        SLT_DBG(*this, "the max possible draft is too small: %d < %d - skipping speculative decoding\n", n_draft_max, min_usable_draft);
         n_draft_max = 0;
     }
     return n_draft_max;
@@ -474,9 +575,8 @@ void server_slot::release() {
         command = SLOT_COMMAND_RELEASE;
         state = SLOT_STATE_IDLE;
         task.reset();
-        llama_decode_reset();
     }
-
+    llama_decode_reset();
 }
 
 
@@ -522,20 +622,76 @@ result_timings server_slot::get_timings() const {
     return timings;
 }
 
-const common_chat_msg& server_slot::update_chat_msg(std::vector<common_chat_msg_diff>& diffs) {
-    auto previous_msg = chat_msg;
+const common_chat_msg& server_slot::update_chat_msg(bool is_partial, std::vector<common_chat_msg_diff>& diffs,
+    bool filter_tool_calls) {
+    auto msg_prv_copy = chat_msg;
     auto new_msg = common_chat_parse(
         generated_text,
         /* is_partial= */ stop != STOP_TYPE_EOS,
-        params.oaicompat_chat_syntax);
+        params.chat_parser_params);
     if (!new_msg.empty()) {
-        new_msg.ensure_tool_call_ids_set(generated_tool_call_ids, gen_tool_call_id);
+        //new_msg.ensure_tool_call_ids_set(generated_tool_call_ids, gen_tool_call_id);
+        new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
         chat_msg = new_msg;
-        diffs = common_chat_msg_diff::compute_diffs(previous_msg, new_msg.empty() ? previous_msg : new_msg);
+        auto all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
+
+        if (!filter_tool_calls) {
+            diffs = std::move(all_diffs);
+        } else {
+            for (auto & d : all_diffs) {
+                // If this is a new type of delta, flush all currently pending tool call names
+                for (size_t i = 0; i < chat_msg.tool_calls.size(); ++i) {
+                    if (sent_tool_call_names.count(i) || chat_msg.tool_calls[i].name.empty()) {
+                        continue;
+                    }
+                    if (d.tool_call_index != i || !d.tool_call_delta.arguments.empty()) {
+                        common_chat_msg_diff header;
+                        header.tool_call_index = i;
+                        header.tool_call_delta.id = chat_msg.tool_calls[i].id;
+                        header.tool_call_delta.name = chat_msg.tool_calls[i].name;
+                        diffs.push_back(std::move(header));
+                        sent_tool_call_names.insert(i);
+                    }
+                }
+
+                if (d.tool_call_index == std::string::npos) {
+                    diffs.push_back(std::move(d));
+                } else {
+                    size_t i = d.tool_call_index;
+                    if (sent_tool_call_names.count(i)) {
+                        if (!d.tool_call_delta.arguments.empty()) {
+                            d.tool_call_delta.name = "";
+                            d.tool_call_delta.id = "";
+                            diffs.push_back(std::move(d));
+                        }
+                    } else {
+                        // Not sent yet.
+                        if (!d.tool_call_delta.arguments.empty() || !is_partial) {
+                            d.tool_call_delta.name = chat_msg.tool_calls[i].name;
+                            d.tool_call_delta.id = chat_msg.tool_calls[i].id;
+                            diffs.push_back(std::move(d));
+                            sent_tool_call_names.insert(i);
+                        } else {
+                            // Suppress
+                        }
+                    }
+                }
+            }
+            // Final check at EOF
+            if (!is_partial) {
+                for (size_t i = 0; i < chat_msg.tool_calls.size(); ++i) {
+                    if (!sent_tool_call_names.count(i) && !chat_msg.tool_calls[i].name.empty()) {
+                        common_chat_msg_diff header;
+                        header.tool_call_index = i;
+                        header.tool_call_delta.id = chat_msg.tool_calls[i].id;
+                        header.tool_call_delta.name = chat_msg.tool_calls[i].name;
+                        diffs.push_back(std::move(header));
+                        sent_tool_call_names.insert(i);
+                    }
+                }
+            }
+        }
     }
-    //LLAMA_LOG_DEBUG("Parsing chat message: %s\n", generated_text.c_str());
-    //LLAMA_LOG_DEBUG("Parsing chat message: %s\n", chat_msg.reasoning_content.c_str());
-    //LLAMA_LOG_DEBUG("Parsing chat message: %s\n", chat_msg.content.c_str());
     return chat_msg;
 }
 
@@ -593,7 +749,8 @@ void server_slot::print_timings() const {
             draft_ratio, n_draft_accepted, n_draft_total
         );
     }
-    common_speculative_print_stats(spec);
+    common_speculative_print_stats(spec, n_gen_second, n_decoded, n_past,
+        const_cast<common_params_speculative *>(&params.speculative));
 }
 
 void server_metrics::init() {
@@ -839,6 +996,21 @@ server_slot* server_context::get_available_slot(const server_task& task) {
     return ret;
 }
 
+int32_t server_context::populate_vocab_pieces() {
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    if (vocab_pieces.size() == n_vocab) {
+        return n_vocab;
+    }
+    vocab_pieces.clear();
+    vocab_pieces.reserve(n_vocab);
+    for (int32_t id = 0; id < n_vocab; ++id) {
+        auto piece = common_token_to_piece(ctx, id, true);
+        max_piece_len = std::max(piece.length(), max_piece_len);
+        vocab_pieces.push_back(std::move(piece));
+    }
+    return n_vocab;
+}
+
 bool server_context::launch_slot_with_task(server_slot& slot, server_task& task) {
     slot_params defaults;
     defaults.speculative = params_base.speculative;
@@ -906,28 +1078,100 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     slot.params.post_sampling_probs = json_value(data, "post_sampling_probs", defaults.post_sampling_probs);
 
     // speculative decoding parameters
-    slot.params.speculative.n_max = json_value(data, "speculative.n_max", params_base.speculative.n_max);
-    slot.params.speculative.n_min = json_value(data, "speculative.n_min", params_base.speculative.n_min);
-    slot.params.speculative.p_min = json_value(data, "speculative.p_min", params_base.speculative.p_min);
+    try {
+        slot.params.speculative = defaults.speculative;
+        const bool has_flat_n_max = json_value_ptr(data, "speculative.n_max") != nullptr;
+        const bool has_flat_n_min = json_value_ptr(data, "speculative.n_min") != nullptr;
+        const bool has_flat_p_min = json_value_ptr(data, "speculative.p_min") != nullptr;
 
-    slot.params.speculative.n_min = std::min(slot.params.speculative.n_max, slot.params.speculative.n_min);
-    slot.params.speculative.n_min = std::max(slot.params.speculative.n_min, 0);
-    slot.params.speculative.n_max = std::max(slot.params.speculative.n_max, 0);
+        slot.params.speculative.n_max = json_value(data, "speculative.n_max", params_base.speculative.n_max);
+        slot.params.speculative.n_min = json_value(data, "speculative.n_min", params_base.speculative.n_min);
+        slot.params.speculative.p_min = json_value(data, "speculative.p_min", params_base.speculative.p_min);
 
-    slot.params.speculative.type = common_speculative_type_from_name(json_value(data, "speculative.type", common_speculative_type_to_str(defaults.speculative.type)));
+        server_reject_dead_speculative_request_overrides(data);
 
-    // Clamp speculative parameters
-    slot.params.speculative.n_min = std::min(slot.params.speculative.n_max, slot.params.speculative.n_min);
-    slot.params.speculative.n_min = std::max(slot.params.speculative.n_min, 0);
-    slot.params.speculative.n_max = std::max(slot.params.speculative.n_max, 0);
+        const json stages = json_value(data, "speculative.stages", json());
+        if (stages.is_null() && !slot.params.speculative.stages.empty()) {
+            for (auto & stage : slot.params.speculative.stages) {
+                if (has_flat_n_max) {
+                    stage.n_max = -1;
+                }
+                if (has_flat_n_min) {
+                    stage.n_min = -1;
+                }
+                if (has_flat_p_min) {
+                    stage.p_min = -1.0f;
+                }
+            }
+        }
 
-    slot.params.speculative.ngram_size_n = json_value(data, "speculative.ngram_size_n", defaults.speculative.ngram_size_n);
-    slot.params.speculative.ngram_size_m = json_value(data, "speculative.ngram_size_m", defaults.speculative.ngram_size_m);
-    slot.params.speculative.ngram_min_hits = json_value(data, "speculative.ngram_m_hits", defaults.speculative.ngram_min_hits);
+        if (!stages.is_null()) {
+            if (!stages.is_array()) {
+                throw std::runtime_error("Error: speculative.stages must be an array");
+            }
 
-    slot.params.speculative.ngram_size_n = std::max(std::min(1, (int)slot.params.speculative.ngram_size_n), 1024);
-    slot.params.speculative.ngram_size_m = std::max(std::min(1, (int)slot.params.speculative.ngram_size_m), 1024);
-    slot.params.speculative.ngram_min_hits = std::max(std::min(1, (int)slot.params.speculative.ngram_min_hits), 1024);
+            const auto default_stages = defaults.speculative.get_resolved_stages();
+            if (stages.size() != default_stages.size()) {
+                throw std::runtime_error("Error: speculative.stages must provide the same number of stages configured at server startup");
+            }
+
+            slot.params.speculative.stages = default_stages;
+            for (size_t i = 0; i < stages.size(); ++i) {
+                const auto stage_override = server_parse_speculative_stage_json(stages[i]);
+                if (stage_override.type != default_stages[i].type) {
+                    throw std::runtime_error("Error: speculative.stages must preserve the stage types configured at server startup");
+                }
+
+                if (stage_override.has_n_max_override()) {
+                    slot.params.speculative.stages[i].n_max = stage_override.n_max;
+                }
+                if (stage_override.has_n_min_override()) {
+                    slot.params.speculative.stages[i].n_min = stage_override.n_min;
+                }
+                if (stage_override.has_p_min_override()) {
+                    slot.params.speculative.stages[i].p_min = stage_override.p_min;
+                }
+            }
+
+            const auto resolved = slot.params.speculative.get_resolved_stages();
+            slot.params.speculative.type = resolved.empty() ? COMMON_SPECULATIVE_TYPE_NONE : resolved.front().type;
+        }
+
+        slot.params.speculative.n_min = std::min(slot.params.speculative.n_max, slot.params.speculative.n_min);
+        slot.params.speculative.n_min = std::max(slot.params.speculative.n_min, 0);
+        slot.params.speculative.n_max = std::max(slot.params.speculative.n_max, 0);
+
+        if (slot.can_speculate() &&
+            llama_model_has_recurrent(model) &&
+            slot.params.speculative.get_max_stage_n_max() > params_base.speculative.get_max_stage_n_max()) {
+            send_error(task,
+                "Error: speculative n_max=" + std::to_string(slot.params.speculative.get_max_stage_n_max()) +
+                " exceeds the recurrent speculative startup limit of " + std::to_string(params_base.speculative.get_max_stage_n_max()) +
+                "; restart the server with a higher n_max inside the configured --spec-type stages to reserve checkpoint capacity",
+                    ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+
+        if (!server_speculative_same_stage_types(slot.params.speculative, defaults.speculative)) {
+            throw std::runtime_error("Error: per-request speculative stages must match the server startup stage types; only stage parameter overrides are supported");
+        }
+
+        if (slot.params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP) && !params_base.has_mtp) {
+            throw std::runtime_error("Error: MTP speculative stage requested, but the server was not started with MTP support");
+        }
+
+        if (slot.params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_DRAFT) && !params_base.speculative.has_dft()) {
+            throw std::runtime_error("Error: draft speculative stage requested, but no draft model is loaded");
+        }
+
+        std::string spec_error;
+        if (!common_speculative_validate_chain(slot.params.speculative, &spec_error)) {
+            throw std::runtime_error("Error: invalid speculative request configuration: " + spec_error);
+        }
+    } catch (const std::exception & e) {
+        send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST);
+        return false;
+    }
 
 
     if (slot.sparams.penalty_last_n < -1) {
@@ -971,16 +1215,28 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
         try {
             auto schema = json_value(data, "json_schema", json::object());
             LLAMA_LOG_DEBUG("JSON schema: %s\n", schema.dump(2).c_str());
-            slot.sparams.grammar = json_schema_to_grammar(schema);
-            LLAMA_LOG_DEBUG("Converted grammar: %s\n", slot.sparams.grammar.c_str());
+            std::string grammar_str = json_schema_to_grammar(schema);
+            SRV_DBG("Converted grammar: %s\n", grammar_str.c_str());
+            slot.sparams.grammar = { COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, std::move(grammar_str) };
         }
         catch (const std::exception& e) {
             throw std::runtime_error(std::string("\"json_schema\": ") + e.what());
         }
     }
     else {
-        slot.sparams.grammar = json_value(data, "grammar", default_sparams.grammar);
-        LLAMA_LOG_DEBUG("Grammar: %s\n", slot.sparams.grammar.c_str());
+        slot.sparams.grammar = default_sparams.grammar;
+        std::string grammar_str = json_value(data, "grammar", std::string());
+        if (!grammar_str.empty()) {
+            // grammar_type key is set by the server when converting chat template grammars
+            std::string grammar_type = json_value(data, "grammar_type", std::string());
+            if (grammar_type == "tool_calls") {
+                slot.sparams.grammar = { COMMON_GRAMMAR_TYPE_TOOL_CALLS, std::move(grammar_str) };
+            } else {
+                // explicit grammar from the user (API field "grammar")
+                slot.sparams.grammar = { COMMON_GRAMMAR_TYPE_USER, std::move(grammar_str) };
+            }
+            LLAMA_LOG_DEBUG("Grammar (%s): %s\n", grammar_type.c_str(), common_grammar_value(slot.sparams.grammar).c_str());
+        }
         slot.sparams.grammar_lazy = json_value(data, "grammar_lazy", default_sparams.grammar_lazy);
         LLAMA_LOG_DEBUG("Grammar lazy: %s\n", slot.sparams.grammar_lazy ? "true" : "false");
     }
@@ -1068,23 +1324,28 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     {
         auto it = data.find("chat_format");
         if (it != data.end()) {
-            slot.params.oaicompat_chat_syntax.format = static_cast<common_chat_format>(it->get<int>());
-            LLAMA_LOG_DEBUG("Chat format: %s\n", common_chat_format_name(slot.params.oaicompat_chat_syntax.format));
+            slot.params.chat_parser_params.format = static_cast<common_chat_format>(it->get<int>());
+            LLAMA_LOG_DEBUG("Chat format: %s\n", common_chat_format_name(slot.params.chat_parser_params.format));
         }
         else {
-            slot.params.oaicompat_chat_syntax.format = defaults.oaicompat_chat_syntax.format;
+            slot.params.chat_parser_params.format = defaults.chat_parser_params.format;
         }
         common_reasoning_format reasoning_format = params_base.reasoning_format;
         if (data.contains("reasoning_format")) {
             reasoning_format = common_reasoning_format_from_name(data.at("reasoning_format").get<std::string>());
         }
-        slot.params.oaicompat_chat_syntax.reasoning_format = reasoning_format;
-        slot.params.oaicompat_chat_syntax.reasoning_in_content = slot.params.stream && (reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY);
-        slot.params.oaicompat_chat_syntax.parse_tool_calls = json_value(data, "parse_tool_calls", false);
+        slot.params.chat_parser_params.reasoning_format = reasoning_format;
+        slot.params.chat_parser_params.reasoning_in_content = slot.params.stream && (reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY);
+        slot.params.chat_parser_params.generation_prompt = json_value(data, "generation_prompt", std::string());
+        slot.sparams.generation_prompt = slot.params.chat_parser_params.generation_prompt;
+        LLAMA_LOG_DEBUG("Generation prompt: '%s'\n", slot.params.chat_parser_params.generation_prompt.c_str());
+        slot.params.chat_parser_params.parse_tool_calls = json_value(data, "parse_tool_calls", false);
         if (data.contains("chat_parser")) {
-            slot.params.oaicompat_chat_syntax.parser.load(data.at("chat_parser").get<std::string>());
+            slot.params.chat_parser_params.parser.load(data.at("chat_parser").get<std::string>());
+        } else {
+            // Reset to default; otherwise a reused slot would apply the previous chat's PEG parser to non-chat outputs (e.g., /v1/completions).
+            slot.params.chat_parser_params.parser = defaults.chat_parser_params.parser;
         }
-        slot.params.oaicompat_chat_syntax.thinking_forced_open = json_value(data, "thinking_forced_open", false);
     }
     {
 
@@ -1146,6 +1407,29 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
 
         if (slot.sparams.grammar_lazy && slot.sparams.grammar_triggers.empty()) {
             throw std::runtime_error("Error: no triggers set for lazy grammar!");
+        }
+    }
+
+    // Parse reasoning budget sampler parameters
+    {
+        const int32_t budget = json_value(data, "reasoning_budget_tokens", (int32_t)-1);
+        const auto start_tag = json_value(data, "reasoning_budget_start_tag", std::string());
+        const auto end_tag = json_value(data, "reasoning_budget_end_tag", std::string());
+        const auto message = json_value(data, "reasoning_budget_message", std::string());
+        slot.sparams.reasoning_budget_tokens = budget;
+
+        if (!start_tag.empty()) {
+            slot.sparams.reasoning_budget_start = common_tokenize(vocab, start_tag, false, true);
+        }
+        if (!end_tag.empty()) {
+            slot.sparams.reasoning_budget_end = common_tokenize(vocab, end_tag, false, true);
+            slot.sparams.reasoning_budget_forced = common_tokenize(vocab, message + end_tag, false, true);
+
+            SRV_DBG("reasoning budget: tokens=%d, generation_prompt='%s', start=%zu toks, end=%zu toks, forced=%zu toks\n",
+                budget, slot.sparams.generation_prompt.c_str(),
+                slot.sparams.reasoning_budget_start.size(),
+                slot.sparams.reasoning_budget_end.size(),
+                slot.sparams.reasoning_budget_forced.size());
         }
     }
 
@@ -1227,7 +1511,7 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
         int32_t banbuffer_size = json_value(data, "banbuffer_size", 0);
         slot.n_buffer = 0; // Ensure buffer calculation starts fresh for this slot
         slot.rewind_count_max = json_value(data, "rewind_count_max", -1);
-        
+
         const auto& banned_strings = data.find("banned_strings");
         if (banned_strings != data.end() && banned_strings->is_array()) {
             slot.ban_phrases.clear();
@@ -1315,17 +1599,117 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
                 }
             }
         }
-
-        if (banbuffer_size > 0) {
-            slot.n_buffer = banbuffer_size;
-        } else {
-            slot.n_buffer = slot.n_buffer + 1; // buffer is longest string/regex + 1
+        if (banned_regex_ci != data.end() || banned_regex != data.end() || banned_strings != data.end()) {
+            if (banbuffer_size > 0) {
+                slot.n_buffer = banbuffer_size;
+            } else {
+                slot.n_buffer = slot.n_buffer + 1; // buffer is longest string/regex + 1
+            }
         }
-
 		slot.logit_bias = slot.sparams.logit_bias; // keep a copy to restore
         slot.ban_phrases_bias = json_value(data, "banned_bias", params_base.ban_phrases_bias);
         slot.banned_n = json_value(data, "banned_n", params_base.banned_n);
     }
+
+    do  // populate allowlist biases
+    {
+        // TODO: JSON parsing for rules and keywords
+        slot.allow_ruless = params_base.allow_ruless;
+        if (slot.allow_ruless.size() == 0) {
+            slot.allow_biasess.clear();
+            break;
+        }
+        slot.allow_kws = params_base.allow_kws;
+
+        slot.allow_pieces = params_base.allow_pieces;
+        const auto& allowlist_piece_array = data.find("allowlist_piece_array");
+        if (allowlist_piece_array != data.end() && allowlist_piece_array->is_array()) {
+            slot.allow_pieces.clear();
+            for (const auto& piece: *allowlist_piece_array) {
+                if (piece.is_string()) {
+                    slot.allow_pieces.push_back(piece.get<std::string>());
+                }
+            }
+        }
+
+        slot.allow_kw_delay = json_value(data, "allowlist_keyword_delay", params_base.allow_kw_delay);
+        // end of allowlist criteria update
+
+        const int32_t n_vocab = populate_vocab_pieces();
+
+        std::unordered_set<llama_token> allow_settoken;
+        for (const auto& piece: slot.allow_pieces) {
+            for (const auto token: common_tokenize(model, piece, false, true)) {
+                allow_settoken.insert(token);
+            }
+        }
+
+        auto n_rules = slot.allow_ruless.size();
+        if (n_rules > slot.allow_kws.size() + 1) {
+            // one more rules than keyword, last rules do not expire
+            n_rules = slot.allow_kws.size() + 1;
+            slot.allow_ruless.resize(n_rules);
+        } else if (n_rules < slot.allow_kws.size()) {
+            // every rules expire
+            slot.allow_kws.resize(n_rules);
+        }
+        slot.allow_biasess.resize(n_rules);
+
+        for (size_t i = 0; i < n_rules; ++i) {
+            const auto& rules = slot.allow_ruless[i];
+            if ((i < slot.allow_ruless_prev.size()) && (rules == slot.allow_ruless_prev[i])) {
+                continue;
+            }
+            LLAMA_LOG_DEBUG("%s: allowlist %zu is new\n", __func__, i);
+
+            auto& biases = slot.allow_biasess[i];
+            biases.resize(n_vocab);
+
+            std::vector<uint32_t> cpts;
+            std::vector<std::string> scripts;
+            for (size_t id = 0; id < n_vocab; ++id) {
+                const size_t n_cpt = llama_fill_from_utf8(&vocab_pieces[id], &cpts, &scripts);
+                float bias = -INFINITY;
+
+                // each codepoint must be found in
+                for (size_t j = 0; j < n_cpt; ++j) {
+                    bool in_rule = false;
+
+                    // at least one rule
+                    for (const auto& rule: rules) {
+                        const bool in_range = (std::get<0>(rule) <= cpts[j]) && (cpts[j] <= std::get<1>(rule));
+                        in_rule = in_range && ((std::get<2>(rule) == "*") || std::get<2>(rule) == scripts[j]);
+                        if (in_rule) {
+                            // earlier rule has higher priority
+                            bias = std::max(bias, std::get<3>(rule));
+                            break;
+                        }
+                    }
+                    if (!in_rule) {
+                        if ((scripts[j] == "common") || (scripts[j] == "inherited")) {
+                            // for common or inherited codepoints (e.g. whitespace), defer to other codepoints in the token
+                            continue;
+                        }
+
+                        // to shadow realm
+                        bias = -INFINITY;
+                        break;
+                    }
+                }
+                biases[id] = bias;
+            }
+
+            float max_bias = -INFINITY;
+            for (const auto& rule: rules) {
+                max_bias = std::max(max_bias, std::get<3>(rule));
+            }
+            for (const auto token: allow_settoken) {
+                biases[token] = max_bias;
+            }
+        }
+    } while (false);
+    slot.allow_ruless_prev = slot.allow_ruless;
+
     if (llama_model_has_recurrent(llama_get_model(slot.ctx))) {
         params_base.can_ban_phrases = false;
         bool do_checkpoint = params_base.ctx_checkpoints_n > 0;
@@ -1337,12 +1721,18 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
         //
         // TODO: try to make this conditional on the context or the memory module, instead of the model type
         params_base.do_checkpoint = do_checkpoint;
-		if (slot.n_buffer != 0) {
-        	LLAMA_LOG_WARN("banned strings is not supported by recurrent model, it will be disabled.\n");
-		}
+        if (slot.n_buffer != 0) {
+            LLAMA_LOG_WARN("banned strings is not supported by recurrent model, it will be disabled.\n");
+        }
         if (params_base.ctx_shift) {
             params_base.ctx_shift = false;
             LOG_WARNING("%s\n", "ctx_shift is not supported by recurrent model, it will be disabled");
+        }
+    }
+    if (llama_model_is_split_mode_graph(llama_get_model(slot.ctx))) {
+        if (params_base.ctx_shift) {
+            params_base.ctx_shift = false;
+            LOG_WARNING("%s\n", "ctx_shift is not implemented for split mode graph, it will be disabled");
         }
     }
     {
@@ -1373,16 +1763,157 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     }
 
     {
-        if (slot.ctx_sampling != nullptr) {
-            common_sampler_free(slot.ctx_sampling);
+        try
+        {
+            if (slot.ctx_sampling != nullptr) {
+                common_sampler_free(slot.ctx_sampling);
+            }
+            slot.ctx_sampling = common_sampler_init(model, slot.sparams);
         }
-        slot.ctx_sampling = common_sampler_init(model, slot.sparams);
+        catch (std::exception & e) {
+            std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
+            send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
         if (slot.ctx_sampling == nullptr) {
             // for now, the only error that may happen here is invalid grammar
             send_error(task, "Failed to parse grammar", ERROR_TYPE_INVALID_REQUEST);
             return false;
         }
     }
+
+    do  // populate expiring logit bias
+    {
+        const auto prev_elb_params = slot.sparams.elb_params;
+
+        const auto& expiring_logit_bias = data.find("expiring_logit_bias");
+        if (expiring_logit_bias != data.end() && expiring_logit_bias->is_array()) {
+            // has new params from api
+            std::string content;
+            for (const auto& line: data["expiring_logit_bias"]) {
+                if (line.is_string()) {
+                    content += line.get<std::string>() + "\n";
+                }
+            }
+            try {
+                argparse_expiring_logit_bias(content, slot.sparams);
+            } catch (const std::invalid_argument& e) {
+                std::cerr << e.what() << '\n';
+            } catch (const std::out_of_range& e) {
+                std::cerr << e.what() << '\n';
+            }
+        }
+
+        const auto& elb_params = slot.sparams.elb_params;
+        if (elb_params.empty()) {
+            slot.ctx_sampling->elb_states.clear();
+            break;
+        }
+
+        if (!slot.prev_elb_states.empty() && (elb_params == prev_elb_params)) {
+            // reset and reuse previous states
+            slot.ctx_sampling->elb_states = slot.prev_elb_states;
+            for (auto& elb_state: slot.ctx_sampling->elb_states) {
+                elb_state.countup = 0;
+            }
+            break;
+        }
+
+        const auto n_elb_param = elb_params.size();
+
+        slot.ctx_sampling->elb_states.clear();
+        slot.ctx_sampling->elb_states.reserve(n_elb_param);
+
+        // 1 state <-> 1 exitword <-> 1+ entries
+        for (int32_t i = 0; i < elb_params.size(); ++i) {
+            const auto& [entries, exitword, op] = elb_params[i];
+
+            if (op == ">>") {
+                for (auto& elb_state: slot.ctx_sampling->elb_states) {
+                    if (elb_state.jumpword.empty()) {
+                        elb_state.jumpword = exitword;
+                        elb_state.jump_idx = i + 1;
+                        elb_state.search_word_len = std::max(elb_state.exitword.length(), elb_state.jumpword.length());
+                    }
+                }
+            }
+
+            slot.ctx_sampling->elb_states.push_back({ { }, { }, exitword, 0, 0, 0, "", 0, exitword.length() });
+
+            auto& first_tokens = slot.ctx_sampling->elb_states.back().first_tokens;
+            auto& other_tokens = slot.ctx_sampling->elb_states.back().other_tokens;
+            auto& delay = slot.ctx_sampling->elb_states.back().delay;
+            auto& max_cond_len = slot.ctx_sampling->elb_states.back().max_cond_len;
+
+            // 1 entry <-> 1 phrase <-> 1+ biases
+            for (auto& entry: entries) {
+                auto biases = entry.biases;
+                if (biases.empty()) {
+                    // expiring sampler bias
+                    continue;
+                }
+
+                // expiring logit bias
+                for (const auto& phrase: entry.phrases) {
+                    auto duration = entry.duration;
+
+                    const auto ids = common_tokenize(model, phrase, false, true);
+                    if (!entry.is_range) {
+                        // extrapolate
+                        biases.resize(ids.size(), biases.back());
+                    } else if (ids.size() == 1) {
+                        biases[0] = biases.back();
+                        biases.resize(1);
+                    } else {
+                        // interpolate
+                        float bb = biases.back();
+                        const float inc = (bb - biases.front()) / (ids.size() - 1);
+                        biases.resize(ids.size());
+                        for (int32_t j = ids.size() - 1; j >= 0; --j) {
+                            biases[j] = bb;
+                            bb -= inc;
+                        }
+                    }
+
+                    if (biases[0] != 0.0f) {
+                        // cond is piece for first_tokens (no match to bias)
+                        first_tokens.push_back({ ids[0], biases[0], size_t(duration), common_token_to_piece(ctx, ids[0], true) });
+                    }
+
+                    int32_t m = 1;
+                    if (duration < 0) {
+                        // -1 is smallest infinite duration
+                        duration ^= 0x7FFFFFFF;
+                        m = -1;
+                    }
+
+                    std::string cond;
+                    for (int32_t j = 1; j < ids.size(); ++j) {
+                        // cond collects preceding string for other_tokens (match to bias)
+                        cond += common_token_to_piece(ctx, ids[j - 1], true);
+                        if (biases[j] == 0.0f) {
+                            continue;
+                        } else if (biases[j] > 0.0f) {
+                            delay = std::max(size_t(duration + m * j), delay);
+                        }
+                        other_tokens.push_back({ ids[j], biases[j], size_t(duration + m * j), cond });
+                    }
+                    max_cond_len = std::max(int32_t(cond.length()), max_cond_len);
+                }
+            }
+        }
+
+        // sort by duration in descending order
+        for (auto& elb_state: slot.ctx_sampling->elb_states) {
+            std::sort(elb_state.first_tokens.begin(), elb_state.first_tokens.end(), [](const auto& a, const auto& b) {
+                return a.duration > b.duration;
+            });
+            std::sort(elb_state.other_tokens.begin(), elb_state.other_tokens.end(), [](const auto& a, const auto& b) {
+                return a.duration > b.duration;
+            });
+        }
+    } while (false);
+    slot.prev_elb_states = slot.ctx_sampling->elb_states;
 
     slot.command = SLOT_COMMAND_LOAD_PROMPT;
     // slot.prompt_tokens.clear();
@@ -1400,6 +1931,13 @@ void server_context::kv_cache_clear() {
 
     // clear the entire KV cache
     llama_kv_cache_clear(ctx);
+    for (auto & slot : slots) {
+        if (slot.spec == nullptr) {
+            continue;
+        }
+
+        common_speculative_clear_sequence(slot.spec, slot.id, true);
+    }
     clean_kv_cache = false;
 }
 
@@ -1451,6 +1989,22 @@ bool server_context::system_prompt_set(const std::string& sys_prompt) {
     // release all slots
     for (server_slot& slot : slots) {
         slot.release();
+        slot.cache_tokens.clear();
+        slot.n_past = 0;
+        slot.n_past_prompt = 0;
+        slot.n_past_offset = 0;
+        slot.n_discarded_prompt = 0;
+        slot.n_kept_prompt = 0;
+        slot.n_prompt_tokens_cache = 0;
+        slot.server_cached_prompt.checkpoints.clear();
+        slot.checkpoint_pos = 0;
+        slot.do_checkpoint = false;
+        if (slot.ctx_sampling != nullptr) {
+            common_sampler_reset(slot.ctx_sampling);
+        }
+    }
+    if (prompt_cache) {
+        prompt_cache->states.clear();
     }
 
     system_need_update = true;
@@ -1486,6 +2040,7 @@ bool server_context::process_token(completion_token_output& result, server_slot&
     slot.sampled = result.tok;
 
     // search stop word and delete it
+    slot.last_gentxt_size = slot.generated_text.size();
     slot.generated_text += token_str;
     slot.has_next_token = true;
 
@@ -1693,13 +2248,12 @@ json server_context::get_formated_generation(const server_slot& slot) const {
         {"logit_bias",                slot.sparams.logit_bias},
         {"n_probs",                   slot.sparams.n_probs},
         {"min_keep",                  slot.sparams.min_keep},
-        {"grammar",                   slot.sparams.grammar},
+        {"grammar",                   slot.sparams.grammar.grammar},
         {"grammar_triggers",          grammar_triggers},
         {"preserved_tokens",          slot.sparams.preserved_tokens},
-        {"chat_format",               common_chat_format_name(slot.params.oaicompat_chat_syntax.format)},
-        {"reasoning_format",          common_reasoning_format_name(slot.params.oaicompat_chat_syntax.reasoning_format)},
-        {"reasoning_in_content",      slot.params.oaicompat_chat_syntax.reasoning_in_content},
-        {"thinking_forced_open",      slot.params.oaicompat_chat_syntax.thinking_forced_open},
+        {"chat_format",               common_chat_format_name(slot.params.chat_parser_params.format)},
+        {"reasoning_format",          common_reasoning_format_name(slot.params.chat_parser_params.reasoning_format)},
+        {"reasoning_in_content",      slot.params.chat_parser_params.reasoning_in_content},
         {"samplers",                  samplers_sequence}
     };
 }
@@ -1768,31 +2322,33 @@ void server_context::send_partial_response(server_slot& slot, completion_token_o
         {"id_slot",    slot.id},
         {"multimodal", false}
     };
-    slot.update_chat_msg(res->oaicompat_msg_diffs);
+    if (server_response_needs_chat_parse(slot.params.oaicompat)) {
+        slot.update_chat_msg(true, res->oaicompat_msg_diffs);
 
-    res->anthropic_has_reasoning = !slot.chat_msg.reasoning_content.empty();
+        res->anthropic_has_reasoning = !slot.chat_msg.reasoning_content.empty();
 
-    res->anthropic_thinking_block_started = slot.anthropic_thinking_block_started;
-    res->anthropic_text_block_started = slot.anthropic_text_block_started;
+        res->anthropic_thinking_block_started = slot.anthropic_thinking_block_started;
+        res->anthropic_text_block_started = slot.anthropic_text_block_started;
 
-    res->oai_resp_thinking_block_started = slot.oai_resp_thinking_block_started;
-    res->oai_resp_text_block_started = slot.oai_resp_text_block_started;
+        res->oai_resp_thinking_block_started = slot.oai_resp_thinking_block_started;
+        res->oai_resp_text_block_started = slot.oai_resp_text_block_started;
 
-    for (const auto& diff : res->oaicompat_msg_diffs) {
-        if (!diff.reasoning_content_delta.empty() && !slot.anthropic_thinking_block_started) {
-            slot.anthropic_thinking_block_started = true;
-        }
-        if (!diff.content_delta.empty() && !slot.anthropic_text_block_started) {
-            slot.anthropic_text_block_started = true;
-        }
-        if (!diff.reasoning_content_delta.empty() && !slot.oai_resp_thinking_block_started) {
-            slot.oai_resp_thinking_block_started = true;
-        }
-        if (!diff.content_delta.empty() && !slot.oai_resp_text_block_started) {
-            slot.oai_resp_text_block_started = true;
-        }
-        if (!diff.tool_call_delta.name.empty()) {
-            slot.oai_resp_fc_id = diff.tool_call_delta.id;
+        for (const auto& diff : res->oaicompat_msg_diffs) {
+            if (!diff.reasoning_content_delta.empty() && !slot.anthropic_thinking_block_started) {
+                slot.anthropic_thinking_block_started = true;
+            }
+            if (!diff.content_delta.empty() && !slot.anthropic_text_block_started) {
+                slot.anthropic_text_block_started = true;
+            }
+            if (!diff.reasoning_content_delta.empty() && !slot.oai_resp_thinking_block_started) {
+                slot.oai_resp_thinking_block_started = true;
+            }
+            if (!diff.content_delta.empty() && !slot.oai_resp_text_block_started) {
+                slot.oai_resp_text_block_started = true;
+            }
+            if (!diff.tool_call_delta.name.empty()) {
+                slot.oai_resp_fc_id = diff.tool_call_delta.id;
+            }
         }
     }
 
@@ -1829,11 +2385,16 @@ void server_context::send_final_response(server_slot& slot) {
     res->post_sampling_probs = slot.params.post_sampling_probs;
     res->oaicompat = slot.params.oaicompat;
     res->oaicompat_cmpl_id = slot.params.oaicompat_cmpl_id;
-    res->oaicompat_msg = slot.update_chat_msg(res->oaicompat_msg_diffs);
+    if (server_response_needs_chat_parse(slot.params.oaicompat)) {
+        res->oaicompat_msg = slot.update_chat_msg(false, res->oaicompat_msg_diffs);
+    }
     res->oai_resp_id = slot.oai_resp_id;
     res->oai_resp_reasoning_id = slot.oai_resp_reasoning_id;
     res->oai_resp_message_id = slot.oai_resp_message_id;
     res->n_decoded = slot.n_decoded;
+    res->n_prompt_tokens_cache = slot.n_prompt_tokens_cache;
+    res->anthropic_thinking_block_started = slot.anthropic_thinking_block_started;
+    res->anthropic_text_block_started = slot.anthropic_text_block_started;
     res->n_prompt_tokens = slot.n_prompt_tokens;
     res->oaicompat_model = slot.task->params.oaicompat_model;
     res->data = json{
@@ -1916,7 +2477,17 @@ void server_context::send_embedding(const server_slot& slot, const llama_batch& 
     queue_results.send(std::move(res));
 }
 
-void server_context::request_completion(int id_task, int id_multi, json data, bool infill, bool embedding, server_tokens&& inputs) {
+void server_context::apply_server_biases(server_slot& slot) {
+    auto& server_biases = slot.ctx_sampling->server_biases;
+
+    if (slot.allow_idx < slot.allow_biasess.size()) {
+        server_biases = &slot.allow_biasess[slot.allow_idx];
+    } else {
+        server_biases = nullptr;
+    }
+}
+
+void server_context::request_completion(int id_task, int id_multi, json data, bool infill, bool embedding, server_tokens & inputs) {
     server_task task;
     task.id = id_task;
     task.id_multi = id_multi;
@@ -1925,7 +2496,7 @@ void server_context::request_completion(int id_task, int id_multi, json data, bo
     task.infill = infill;
     task.embedding = embedding;
     task.type = SERVER_TASK_TYPE_COMPLETION;
-    task.tokens = std::move(inputs);
+    task.tokens = inputs.clone();
     // when a completion task's prompt array is not a singleton, we split it into multiple requests
     // otherwise, it's a single-prompt task, we actually queue it
     // if there's numbers in the prompt array it will be treated as an array of tokens
@@ -1964,7 +2535,8 @@ void server_context::request_cancel(int id_task) {
 }
 
 void server_context::split_multiprompt_task(int id_multi, server_task& multiprompt_task) {
-    const int prompt_count = multiprompt_task.data.at("prompt").size();
+    auto prompts = multiprompt_task.data.at("prompt");
+    const int prompt_count = prompts.size();
     if (prompt_count <= 1) {
         send_error(multiprompt_task, "error while handling multiple prompts");
         return;
@@ -1982,12 +2554,123 @@ void server_context::split_multiprompt_task(int id_multi, server_task& multiprom
     // add subtasks
     for (int i = 0; i < prompt_count; i++) {
         json subtask_data = multiprompt_task.data;
-        subtask_data["prompt"] = subtask_data.at("prompt")[i];
+        subtask_data["prompt"] = prompts[i];
 
         // subtasks inherit everything else (infill mode, embedding mode, etc.)
         request_completion(subtask_ids[i], id_multi, subtask_data, multiprompt_task.infill, multiprompt_task.embedding,
-            std::move(multiprompt_task.tokens));
+            multiprompt_task.tokens);
     }
+}
+
+
+
+static size_t save_checkpoints_to_file(const std::string & filename, const std::list<server_prompt_checkpoint> & checkpoints) {
+    if (checkpoints.size() == 0) {
+        return 0;
+    }
+    std::ofstream file(filename, std::ios::binary);
+    uint32_t magic = LLAMA_STATE_SEQ_MAGIC;
+    file.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
+    uint32_t version = LLAMA_STATE_SEQ_VERSION;
+    file.write(reinterpret_cast<const char *>(&version), sizeof(version));
+    size_t count = checkpoints.size();
+    file.write(reinterpret_cast<const char *>(&count), sizeof(count));
+
+    for (const auto & checkpoint : checkpoints) {
+        file.write(reinterpret_cast<const char *>(&checkpoint.pos_min), sizeof(checkpoint.pos_min));
+        file.write(reinterpret_cast<const char *>(&checkpoint.pos_max), sizeof(checkpoint.pos_max));
+        file.write(reinterpret_cast<const char *>(&checkpoint.pos_min_prompt), sizeof(checkpoint.pos_min_prompt));
+        file.write(reinterpret_cast<const char *>(&checkpoint.pos_max_prompt), sizeof(checkpoint.pos_max_prompt));
+        size_t data_len = checkpoint.data.size();
+        file.write(reinterpret_cast<const char *>(&data_len), sizeof(data_len));
+        if (data_len > 0) {
+            file.write(reinterpret_cast<const char *>(checkpoint.data.data()), data_len * sizeof(uint8_t));
+        }
+    }
+    size_t pos = file.tellp();
+    file.close();
+    return pos;
+}
+
+static size_t load_checkpoints_from_file(const std::string & filename, std::list<server_prompt_checkpoint> & checkpoints) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        return 0;
+    }
+    checkpoints.clear();
+    // version checks
+    {
+        uint32_t magic;
+        file.read(reinterpret_cast<char *>(&magic), sizeof(magic));
+        uint32_t version;
+        file.read(reinterpret_cast<char *>(&version), sizeof(version));
+
+        if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
+            LLAMA_LOG_ERROR("%s: unknown (magic, version) for checkpoint file: %08x, %08x\n", __func__, magic, version);
+            return 0;
+        }
+    }
+    // load the checkpoints
+    {
+        size_t count;
+        file.read(reinterpret_cast<char *>(&count), sizeof(count));
+
+        for (int i = 0; i < count; i++) {
+            server_prompt_checkpoint checkpoint;
+            file.read(reinterpret_cast<char *>(&checkpoint.pos_min), sizeof(checkpoint.pos_min));
+            file.read(reinterpret_cast<char *>(&checkpoint.pos_max), sizeof(checkpoint.pos_max));
+            file.read(reinterpret_cast<char *>(&checkpoint.pos_min_prompt), sizeof(checkpoint.pos_min_prompt));
+            file.read(reinterpret_cast<char *>(&checkpoint.pos_max_prompt), sizeof(checkpoint.pos_max_prompt));
+
+            size_t data_len;
+            file.read(reinterpret_cast<char *>(&data_len), sizeof(data_len));
+            if (data_len > 0) {
+                checkpoint.data.resize(data_len);
+                file.read(reinterpret_cast<char *>(checkpoint.data.data()), data_len * sizeof(uint8_t));
+            }
+            checkpoints.push_back(checkpoint);
+        }
+    }
+    size_t pos = file.tellg();
+    file.close();
+    return pos;
+}
+
+static size_t save_server_tokens_to_file(const std::string & filename, const server_tokens & tokens) {
+    std::ofstream file(filename, std::ios::binary);
+    json token_json = tokens.to_json();
+    token_json["magic"] = LLAMA_SERVER_MAGIC;
+    token_json["version"] = LLAMA_SERVER_VERSION;
+    size_t pos = 0;
+    if (file.is_open()) {
+        file << token_json;
+        pos = file.tellp();
+        file.close();
+    }
+    return pos;
+}
+
+static size_t load_server_tokens_from_file(const std::string & filename,  server_tokens & tokens) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        return 0;
+    }
+    size_t pos = 0;
+    json token_json;
+    if (file.is_open()) {
+        file >> token_json;
+        pos = file.tellg();
+        file.close();
+    }
+    uint32_t magic = token_json.value<uint32_t>("magic", 0);
+    uint32_t version = token_json.value<uint32_t>("version", 0);
+    if (magic != LLAMA_SERVER_MAGIC || version != LLAMA_SERVER_VERSION) {
+        LLAMA_LOG_ERROR("%s: unknown (magic, version) for token file: %08x, %08x\n", __func__, magic, version);
+        return 0;
+    }
+    tokens.from_json(token_json);
+
+    return pos;
 }
 
 void server_context::process_single_task(server_task&& task) {
@@ -2148,14 +2831,14 @@ void server_context::process_single_task(server_task&& task) {
             queue_tasks.defer(std::move(task));
             break;
         }
-        if (slot->cache_tokens.has_mtmd_data() && !check_no_mtmd(task.id)) {
-            break;
-        }
+
         const size_t token_count = slot->cache_tokens.size();
         const int64_t t_start = ggml_time_us();
 
         std::string filename = task.data.at("filename");
         std::string filepath = task.data.at("filepath");
+        save_server_tokens_to_file(filepath+".tokens.json", slot->cache_tokens);
+        size_t saved = save_checkpoints_to_file(filepath + ".checkpoints", slot->server_cached_prompt.checkpoints);
 
         const size_t nwrite = llama_state_seq_save_file(ctx, filepath.c_str(), slot->id, slot->cache_tokens.data(), token_count);
 
@@ -2170,7 +2853,7 @@ void server_context::process_single_task(server_task&& task) {
             { "id_slot",   id_slot },
             { "filename",  filename },
             { "n_saved",   token_count }, // tokens saved
-            { "n_written", nwrite },      // bytes written
+            { "n_written", nwrite + saved },      // bytes written
             { "timings", {
                 { "save_ms", t_save_ms }
             } }
@@ -2191,9 +2874,6 @@ void server_context::process_single_task(server_task&& task) {
             queue_tasks.defer(std::move(task));
             break;
         }
-        if (slot->cache_tokens.has_mtmd_data() && !check_no_mtmd(task.id)) {
-            break;
-        }
         const int64_t t_start = ggml_time_us();
 
         std::string filename = task.data.at("filename");
@@ -2207,10 +2887,9 @@ void server_context::process_single_task(server_task&& task) {
             send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
             break;
         }
-        slot->cache_tokens.resize(token_count);
-        if (mctx) {
-            slot->cache_tokens.has_mtmd = true;
-        }
+        load_server_tokens_from_file(filepath+".tokens.json", slot->cache_tokens);
+        size_t loaded = load_checkpoints_from_file(filepath + ".checkpoints", slot->server_cached_prompt.checkpoints);
+
         const int64_t t_end = ggml_time_us();
         const double t_restore_ms = (t_end - t_start) / 1000.0;
 
@@ -2243,14 +2922,13 @@ void server_context::process_single_task(server_task&& task) {
             queue_tasks.defer(std::move(task));
             break;
         }
-        if (slot->cache_tokens.has_mtmd_data() && !check_no_mtmd(task.id)) {
-            break;
-        }
         // Erase token cache
         const size_t n_erased = slot->cache_tokens.size();
         llama_kv_cache_seq_rm(ctx, slot->id, -1, -1);
-        slot->cache_tokens.clear();
-
+        slot->cache_tokens.keep_first(0);
+        //slot->cache_tokens.clear();
+        slot->server_cached_prompt.checkpoints.clear();
+        slot->server_cached_prompt.data.clear();
         server_task_result result;
         result.id = task.id;
         result.stop = true;
@@ -2506,8 +3184,11 @@ void server_context::discard_n_kv_and_cache_tokens(llama_context* ctx, server_sl
     auto kv_past = slot.cache_tokens.pos_next(slot.n_past);
     int32_t pos_min = llama_kv_cache_seq_pos_min(slot.ctx, slot.id);
     const auto pos_max = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
-    llama_kv_cache_seq_rm(ctx, slot.id, kv_keep, kv_keep + kv_discard);
+    llama_kv_cache_seq_rm(ctx, slot.id, slot.cache_tokens.pos_next(kv_keep), slot.cache_tokens.pos_next(kv_keep + kv_discard));
     llama_kv_cache_seq_add(ctx, slot.id, kv_keep + kv_discard, kv_past, -kv_discard);
+    if (slot.uses_mtp() && slot.spec) {
+        common_speculative_context_shift(slot.spec, slot.id, kv_keep, kv_discard, kv_past);
+    }
     if (slot.params.cache_prompt) {
         slot.cache_tokens.discard_n_tokens(n_keep, n_discard);
     }
@@ -2712,38 +3393,39 @@ void server_context::add_sampled_tokens() {
         // generate draft tokens in speculative decoding mode
         // TODO: rework to have a single draft llama_context shared across all slots [TAG_SERVER_SPEC_REWORK]
         //       perform the speculative drafting for all sequences at the same time in a single batch
-        const int n_draft_max = slot.get_n_draft_max();
-        if (n_draft_max > 0) {
-            if (mctx) {
+        const int n_draft_max_pre = slot.get_n_draft_max();
+        if (n_draft_max_pre > 0) {
+            if (mctx && !slot.uses_mtp()) {
                 // we should never reach this, as speculative is automatically disabled if mmproj is loaded
                 GGML_ABORT("not supported by multimodal");
             }
 
-            const llama_tokens & cached_text_tokens = slot.cache_tokens.get_text_tokens();
+            static const llama_tokens empty_prompt;
+            const llama_tokens & cached_text_tokens = slot.uses_mtp() && !slot.params.speculative.has_composite_stage_chain()
+                ? empty_prompt
+                : slot.cache_tokens.get_text_tokens();
 
-            const auto & params_spec = slot.params.speculative;
+            auto & params_spec = slot.params.speculative;
+            const llama_pos draft_base_pos = slot.uses_mtp() ? slot.cache_tokens.pos_next() : -1;
+            common_speculative_draft_result draft_result = common_speculative_draft_ex(
+                slot.spec,
+                ctx,
+                params_spec,
+                cached_text_tokens,
+                slot.sampled,
+                draft_base_pos,
+                slot.id);
+            llama_tokens & draft = draft_result.tokens;
 
-            if (slot.has_mtp) {
-                if (!slot.mtp_hidden_state.empty()) {
-                    const int n_embd = llama_model_n_embd(llama_get_model(ctx));
-                    const int n_hidden = slot.mtp_hidden_state.size() / n_embd;
-                    llama_set_draft_input_hidden_state(ctx, slot.mtp_hidden_state.data() + (n_hidden - 1) * n_embd);
-                } else {
-                    LOG_ERROR("MTP hidden state is empty during speculation", {});
-                    const float* emb_neg1 = llama_get_embeddings_ith(ctx, -1);
-                    if (emb_neg1) {
-                        const int n_embd = llama_model_n_embd(llama_get_model(ctx));
-                        slot.mtp_hidden_state.resize(n_embd);
-                        memcpy(slot.mtp_hidden_state.data(), emb_neg1, n_embd * sizeof(float));
-                        llama_set_draft_input_hidden_state(ctx, slot.mtp_hidden_state.data());
-                    }
-                }
-            }
-
-            llama_tokens draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
+            const int n_draft_max = slot.get_n_draft_max();
 
             if (draft.size() > (size_t)n_draft_max) {
-                SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int)draft.size(), n_draft_max);
+                if (slot.params.speculative.autotune) {
+                    // expected near end-of-response when autotune shrinks n_max
+                    SLT_DBG(slot, "draft size %d exceeds max %d, truncating\n", (int)draft.size(), n_draft_max);
+                } else {
+                    SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int)draft.size(), n_draft_max);
+                }
                 draft.resize(n_draft_max);
             }
 
@@ -2752,14 +3434,14 @@ void server_context::add_sampled_tokens() {
             common_batch_add(batch, slot.sampled, slot.cache_tokens.pos_next(), { slot.id }, true);
             slot.cache_tokens.push_back(slot.sampled);
 
-            if (slot.params.speculative.n_min > (int)draft.size()) {
-                SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int)draft.size(), slot.params.speculative.n_min);
+            const int min_usable_draft = slot.params.speculative.get_min_usable_stage_n_min();
+            if (min_usable_draft > (int)draft.size()) {
+                SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int)draft.size(), min_usable_draft);
                 // fallback to normal decoding
                 slot.i_batch = slot.i_batch_dft[0];
                 slot.drafted.clear();
                 slot.i_batch_dft.clear();
-            }
-            else {
+            } else {
                 // keep track of total number of drafted tokens tested
                 slot.n_draft_total += draft.size();
 
@@ -2805,7 +3487,7 @@ void server_context::apply_checkpoint(server_slot & slot) {
     if (slot.n_past > 0 && slot.n_past < slot.cache_tokens.n_tokens()) {
         int32_t pos_min = llama_kv_cache_seq_pos_min(slot.ctx, slot.id);
 
-        if (pos_min > pos_min_thold) {
+        if (pos_min >= pos_min_thold) {
             SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", slot.n_past, (int)slot.cache_tokens.size(), slot.id, pos_min);
 
             // search for a context checkpoint
@@ -2813,8 +3495,7 @@ void server_context::apply_checkpoint(server_slot & slot) {
                 slot.server_cached_prompt.checkpoints.rbegin(),
                 slot.server_cached_prompt.checkpoints.rend(),
                 [&](const auto & cur) {
-                    // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
-                    return cur.pos_min < pos_min_thold;
+                    return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                 }
             );
 
@@ -2827,23 +3508,30 @@ void server_context::apply_checkpoint(server_slot & slot) {
                 const size_t n = llama_state_seq_set_data(ctx, it->data.data(), checkpoint_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                 if (n != checkpoint_size) {
-                    SLT_ERR(slot, "failed to restore context checkpoint (pos_min = %d, pos_max = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, (float)checkpoint_size / 1024 / 1024);
+                    SLT_ERR(slot, "failed to restore context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, (float)checkpoint_size / 1024 / 1024);
                     do_reset = true;
                     //printf("[DEBUG] `do_reset` was set to `true` after failing to restore a checkpoint");
                 } else {
-                    slot.n_past = std::min(slot.n_past, std::max(it->pos_min+1, it->pos_max));
-                    slot.n_past = slot.cache_tokens.size_up_to_pos(slot.n_past-1);
-                    slot.n_past_prompt = std::min(slot.n_past_prompt, std::max(it->pos_min_prompt+1, it->pos_max_prompt));
-                    slot.n_past_prompt = slot.prompt_tokens.size_up_to_pos(slot.n_past_prompt-1);
-                    SLT_WRN(slot, "restored context checkpoint took  %.2f ms (pos_min = %d, pos_max = %d, size = %.3f MiB)\n", (ggml_time_us() - t_start) / 1000.0, it->pos_min, it->pos_max, (float)checkpoint_size / 1024 / 1024);
+                    pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                    slot.n_past = slot.cache_tokens.size_up_to_pos(pos_next);
+
+                    pos_next = slot.prompt_tokens.pos_next(slot.n_past_prompt);
+                    pos_next = std::min(pos_next, std::max(it->pos_min_prompt + 1, it->pos_max_prompt));
+                    slot.n_past_prompt = slot.prompt_tokens.size_up_to_pos(pos_next);
+                    SLT_WRN(slot, "restored context checkpoint took  %.2f ms (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", (ggml_time_us() - t_start) / 1000.0, it->pos_min, it->pos_max, it->n_tokens, slot.n_past, (float)checkpoint_size / 1024 / 1024);
                 }
             }
 
             if (do_reset) {
-                SLT_WRN(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
+                SLT_WRN(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA, see %s)\n",
                     "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                 slot.n_past = 0;
                 slot.n_past_prompt = 0;
+                slot.n_past_se = 0;
+                slot.ga_i = 0;
+                slot.cache_tokens.keep_first(0);
+                pos_next = 0;
+                common_sampler_reset(slot.ctx_sampling);
             }
         }
     }
@@ -2852,7 +3540,7 @@ void server_context::apply_checkpoint(server_slot & slot) {
         // erase any checkpoints with pos_min > pos_min_thold
         for (auto it = slot.server_cached_prompt.checkpoints.begin(); it != slot.server_cached_prompt.checkpoints.end();) {
             const auto & cur = *it;
-            if (cur.pos_min > pos_min_thold) {
+            if (cur.pos_max > pos_min_thold) {
                 SLT_WRN(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, (float)cur.data.size() / 1024 / 1024);
                 it = slot.server_cached_prompt.checkpoints.erase(it);
             } else {
@@ -2868,10 +3556,10 @@ bool server_context::create_checkpoint(server_slot & slot) {
     const auto pos_max = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
 
     // no need for empty or small checkpoints
-    do_checkpoint = do_checkpoint && (pos_min >= 0 && pos_max >= 16);
+    do_checkpoint = do_checkpoint && (pos_min >= 0 && slot.cache_tokens.n_tokens() >= 64);
 
     // no need to create checkpoints that are too close together
-    do_checkpoint = do_checkpoint && (slot.server_cached_prompt.checkpoints.empty() || pos_max > slot.server_cached_prompt.checkpoints.back().pos_max);
+    do_checkpoint = do_checkpoint && (slot.server_cached_prompt.checkpoints.empty() || slot.cache_tokens.n_tokens() > slot.server_cached_prompt.checkpoints.back().n_tokens);
 
     if (do_checkpoint) {
         const int64_t t_start = ggml_time_us();
@@ -2879,26 +3567,17 @@ bool server_context::create_checkpoint(server_slot & slot) {
             // make room for the new checkpoint, if needed
             const auto & cur = slot.server_cached_prompt.checkpoints.front();
 
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, size = %.3f MiB)\n",
-                cur.pos_min, cur.pos_max, (float)cur.data.size() / 1024 / 1024);
+            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                cur.pos_min, cur.pos_max, cur.n_tokens, (float)cur.data.size() / 1024 / 1024);
 
             slot.server_cached_prompt.checkpoints.erase(slot.server_cached_prompt.checkpoints.begin());
         }
 
-        const size_t checkpoint_size = llama_state_seq_get_size(ctx, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        auto & cur = slot.server_cached_prompt.checkpoints.emplace_back();
+        server_prompt_checkpoint_update(cur, ctx, slot.id, slot.cache_tokens.n_tokens(), pos_min, pos_max, slot.n_past_offset);
 
-        auto & cur = slot.server_cached_prompt.checkpoints.emplace_back(server_prompt_checkpoint{
-            /*.pos_min = */ pos_min,
-            /*.pos_max = */ pos_max,
-            /*.pos_min_prompt = */ pos_min + slot.n_past_offset,
-            /*.pos_max_prompt = */ pos_max + slot.n_past_offset ,
-            /*.data    = */ std::vector<uint8_t>(checkpoint_size),
-            });
-
-        llama_state_seq_get_data(ctx, cur.data.data(), checkpoint_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-        SLT_WRN(slot, "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, size = %.3f MiB, took %.2f ms)\n",
-            (int)slot.server_cached_prompt.checkpoints.size(), params_base.ctx_checkpoints_n, cur.pos_min, cur.pos_max, (float)cur.data.size() / 1024 / 1024,
+        SLT_WRN(slot, "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, took %.2f ms)\n",
+            (int)slot.server_cached_prompt.checkpoints.size(), params_base.ctx_checkpoints_n, cur.pos_min, cur.pos_max, cur.n_tokens, (float)cur.data.size() / 1024 / 1024,
             (ggml_time_us() - t_start) / 1000.0);
     }
     return do_checkpoint;
@@ -3048,16 +3727,16 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             LLAMA_LOG_INFO("======== Cache: cache_size = %d, n_past0 =  %d, n_past1 =  %d, n_past_prompt1 = %d,  n_past2 =  %d, n_past_prompt2 =  %d\n", (int32_t)slot.cache_tokens.size(), (int32_t)n_past0, (int32_t)prefix.first, (int32_t)prefix.second, (int32_t)prefix_nonexact.first, (int32_t)prefix_nonexact.second);
                             int32_t size_threshold = 20;
                             if (prefix.first + size_threshold < prefix_nonexact.first) {
-                                LLAMA_LOG_WARN("Common part contains missing or extra space and new line\n");
+                                // LLAMA_LOG_WARN("Common part contains missing or extra space and new line\n");
                                 prefix = prefix_nonexact;
                             }
                             slot.n_past = prefix.first;
                             slot.n_past_prompt = prefix.second;
                             slot.n_past_offset = slot.n_past_prompt - slot.n_past;
 
-                            if (slot.n_past != slot.n_past_prompt) {
-                                LLAMA_LOG_INFO("Mistokenization found and handled successfully.\n");
-                            }
+                            //if (slot.n_past != slot.n_past_prompt) {
+                            //    LLAMA_LOG_INFO("Mistokenization found and handled successfully.\n");
+                            //}
                             if ((slot.n_past + size_threshold < slot.cache_tokens.size()))
                             {
                                 LLAMA_LOG_WARN("Common part does not match fully\n");
@@ -3087,7 +3766,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             slot.n_past_se--;
                         }
                     }
-
+                    slot.n_prompt_tokens_cache = slot.n_past_prompt;
                     slot.n_prompt_tokens_processed = 0;
                 }
 
@@ -3116,9 +3795,10 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                 slot.cache_tokens.keep_first(slot.n_past);
                 int p0 = (int)system_tokens.size() + slot.n_past;
                 p0 = system_tokens.size() + slot.cache_tokens.pos_next();
-                if (!llama_kv_cache_seq_rm(ctx, slot.id, p0, -1)) {
+                const bool trimmed = common_speculative_trim_sequence(slot.spec, ctx, slot.id, p0);
+                if (!trimmed) {
                     // could not partially delete (likely using a non-Transformer model)
-                    llama_kv_cache_seq_rm(ctx, slot.id, -1, -1);
+                    common_speculative_clear_sequence_kv(slot.spec, ctx, slot.id);
 
                     p0 = (int)system_tokens.size();
                     if (p0 != 0) {
@@ -3127,9 +3807,16 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     }
 
                     // there is no common part left (except for the system prompt)
+                    slot.cache_tokens.clear();
                     slot.n_past = 0;
+                    slot.n_past_prompt = 0;
+                    slot.n_past_offset = 0;
+                    slot.n_discarded_prompt = 0;
+                    slot.n_kept_prompt = 0;
                     slot.n_past_se = 0;
+                    slot.n_prompt_tokens_cache = 0;
                     slot.ga_i = 0;
+                    slot.server_cached_prompt.checkpoints.clear();
                     // TODO: is the system prompt ever in the sampling context?
                     common_sampler_reset(slot.ctx_sampling);
                 }
@@ -3146,7 +3833,15 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     // process the image
                     size_t n_tokens_out = 0;
                     llama_pos p1 = slot.cache_tokens.pos_next() + slot.n_past_prompt - slot.n_past; // add offset to prompt
-                    int32_t res = slot.prompt_tokens.process_chunk(ctx, mctx, slot.n_past_prompt, p1, slot.id, n_tokens_out);
+                    server_mtp_warmup mtp_media_warmup {
+                        ctx,
+                        slot.uses_mtp() && slot.spec ? &slot : nullptr,
+                    };
+                    mtmd_helper_eval_batch_callback mtp_media_callback =
+                        mtp_media_warmup.slot ? server_mtp_media_warmup_callback : nullptr;
+                    int32_t res = slot.prompt_tokens.process_chunk(
+                            ctx, mctx, slot.n_past_prompt, p1, slot.id, n_tokens_out,
+                            mtp_media_callback, &mtp_media_warmup);
                     if (res != 0) {
                         LLAMA_LOG_ERROR("failed to process image, res = %d\n", res);
                         slot.release();
@@ -3205,7 +3900,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                         slot.do_checkpoint = true;
                         break;
                     }
-                    
+
                 }
                 LOG_VERBOSE("prompt processing progress", {
                     {"id_slot",  slot.id},
@@ -3288,31 +3983,41 @@ void server_context::speculative_decoding_accept() {
             continue;
         }
 
+        const llama_token sampled_before = slot.sampled;
         size_t n_draft = slot.drafted.size();
 
-        // the accepted tokens from the speculation
-        const auto ids = common_sampler_sample_and_accept_n(slot.ctx_sampling, ctx, slot.i_batch_dft, slot.drafted);
-        
-        if (slot.has_mtp) {
-            const int n_embd = llama_model_n_embd(llama_get_model(ctx));
-            if (!ids.empty()) {
-                const float* emb = llama_get_embeddings(ctx);
-                if (emb) {
-                    slot.mtp_hidden_state.resize(ids.size() * n_embd);
-                    memcpy(slot.mtp_hidden_state.data(), emb, ids.size() * n_embd * sizeof(float));
-                }
-            } else {
-                const float* emb0 = llama_get_embeddings_ith(ctx, 0);
-                if (emb0) {
-                    slot.mtp_hidden_state.resize(n_embd);
-                    memcpy(slot.mtp_hidden_state.data(), emb0, n_embd * sizeof(float));
-                }
-            }
-            
-            llama_set_draft_input_hidden_state(ctx, slot.mtp_hidden_state.data());
+        slot.ctx_sampling->to_generated_text = &slot.generated_text;
+        if (n_draft > 0) {
+            (void) populate_vocab_pieces();     // max_piece_len
+            slot.ctx_sampling->drafted_text.reserve(max_piece_len * n_draft);
+            slot.ctx_sampling->drafted_text.clear();
+        }
 
-            int32_t n_past_base = slot.n_past - (slot.drafted.size() + 1);
-            mtp_accept_tokens(ctx, ids, n_past_base, slot.id);
+        apply_server_biases(slot);
+
+        // the accepted tokens from the speculation
+        std::vector<llama_token> ids;
+        try {
+            ids = common_sampler_sample_and_accept_n(slot.ctx_sampling, ctx, slot.i_batch_dft, slot.drafted);
+        } catch (const std::exception & e) {
+            LOG_ERROR("speculative sampling failed, releasing slot", {
+                {"id_slot", slot.id},
+                {"id_task", slot.id_task},
+                {"error", e.what()},
+            });
+            send_error(slot, std::string("sampling error: ") + e.what(), ERROR_TYPE_SERVER);
+            slot.release();
+            slot.i_batch = -1;
+            slot.i_batch_dft.clear();
+            slot.drafted.clear();
+            continue;
+        }
+
+        std::vector<int32_t> accepted_output_indices;
+        if (slot.uses_mtp()) {
+            if (!ids.empty()) {
+                accepted_output_indices.assign(slot.i_batch_dft.begin(), slot.i_batch_dft.begin() + ids.size());
+            }
         }
 
         slot.i_batch_dft.clear();
@@ -3326,18 +4031,27 @@ void server_context::speculative_decoding_accept() {
         // update how many tokens out of those tested were accepted
         slot.n_draft_accepted += ids.size() - 1;
 
-        // inform the speculative decoding about the number of accepted tokens
-        common_speculative_accept(slot.spec, ids.size() - 1);
-
         // rollback to the state before sampling the draft tokens
         slot.cache_tokens.keep_first(slot.cache_tokens.n_tokens() - n_draft);
+        const llama_pos spec_pos_base = slot.cache_tokens.pos_next();
 
         // add accepted tokens to the prompt
-        slot.cache_tokens.insert({ ids.begin(), ids.end() - 1 });
+        for (auto it = ids.begin(); it != ids.end() - 1; ++it) {
+            slot.cache_tokens.push_back(*it);
+        }
         slot.sampled = ids.back(); // last accepted token
         slot.n_past = slot.cache_tokens.n_tokens();
 
-        llama_kv_cache_seq_rm(ctx, slot.id, slot.n_past, -1);
+        common_speculative_commit(
+            slot.spec,
+            ctx,
+            slot.ctx_sampling,
+            slot.id,
+            sampled_before,
+            ids,
+            n_draft,
+            spec_pos_base,
+            accepted_output_indices);
 
         for (size_t i = 0; i < ids.size(); ++i) {
             completion_token_output result;
@@ -3353,8 +4067,6 @@ void server_context::speculative_decoding_accept() {
             if (slot.n_buffer == 0 || !params_base.can_ban_phrases) {
                 if (!process_token(result, slot)) {
                     // release slot because of stop condition
-                    slot.cache_tokens.push_back(slot.sampled);
-                    slot.n_past++;
                     send_final_response(slot);
                     release_slot_after_final_response(slot);
                     break;
@@ -3367,6 +4079,8 @@ void server_context::speculative_decoding_accept() {
             }
 
             common_sampler_review(slot.ctx_sampling, slot.token_buffer.size(), slot.rewind_status);
+
+            update_allowlist_state(slot);
         }
         SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int)ids.size() - 1, (int)slot.drafted.size(), slot.n_past);
         LOG_VERBOSE("speculative decoding result", {
@@ -3396,22 +4110,20 @@ void server_context::release_slot_after_final_response(server_slot & slot) {
 void server_context::send_token_results(completion_token_outputs& results, server_slot& slot, int32_t n) {
     int count = 0;
     bool released = false;
-    
+
     int32_t start_pos = slot.n_past - (int32_t)slot.token_buffer.size() + 1;
 
     for (auto& it : results) {
         bool has_next = process_token(it, slot);
-        
+
         // Clean up positional bans for the token we just confirmed/sent
         slot.positional_bans.erase(start_pos + count);
-        
+
         count++;
         if (!has_next) {
             if (slot.stopped_limit && !slot.stopped_eos && !slot.stopped_word) {
                 continue;
             }
-            slot.cache_tokens.push_back(slot.sampled);
-            slot.n_past++;
             send_final_response(slot);
             release_slot_after_final_response(slot);
             released = true;
@@ -3423,8 +4135,6 @@ void server_context::send_token_results(completion_token_outputs& results, serve
     }
 
     if (!released && slot.stopped_limit && !slot.stopped_eos && !slot.stopped_word) {
-        slot.cache_tokens.push_back(slot.sampled);
-        slot.n_past++;
         send_final_response(slot);
         release_slot_after_final_response(slot);
     }
@@ -3441,7 +4151,7 @@ inline int32_t check_ban_phrase(server_slot& slot) {
 
     std::string string_buffer;
     std::vector<size_t> token_offsets;
-    
+
     for (const auto& it : slot.token_buffer) {
         token_offsets.push_back(string_buffer.size());
         string_buffer += it.text_to_send;
@@ -3493,10 +4203,10 @@ inline int32_t check_ban_phrase(server_slot& slot) {
     if (found) {
         int32_t token_idx = -1;
         for (size_t i = 0; i < token_offsets.size(); ++i) {
-            size_t len = (i == token_offsets.size() - 1) 
-                ? string_buffer.size() - token_offsets[i] 
+            size_t len = (i == token_offsets.size() - 1)
+                ? string_buffer.size() - token_offsets[i]
                 : token_offsets[i+1] - token_offsets[i];
-            
+
             if (best_start >= token_offsets[i] && best_start < token_offsets[i] + len) {
                 token_idx = (int32_t)i;
                 break;
@@ -3514,7 +4224,7 @@ inline int32_t check_ban_phrase(server_slot& slot) {
 
 inline void rewind_context(server_slot& slot, int32_t ban_pos) {
     slot.rewind_count++;
-    
+
     int32_t buffer_start_pos = slot.n_past - (int32_t)slot.token_buffer.size() + 1;
     int32_t n_keep_buffer = ban_pos - buffer_start_pos;
     if (n_keep_buffer < 0) n_keep_buffer = 0;
@@ -3523,9 +4233,9 @@ inline void rewind_context(server_slot& slot, int32_t ban_pos) {
         int32_t n = 0;
         for (auto result = slot.token_buffer.begin() + n_keep_buffer; result != slot.token_buffer.end(); result++) {
             llama_token banned_tok = result->tok;
-            
+
             if (n == 0) {
-                LLAMA_LOG_DEBUG("Banned pattern detected at pos %d. Banning token %d ('%s') and rewinding.\n", 
+                LLAMA_LOG_DEBUG("Banned pattern detected at pos %d. Banning token %d ('%s') and rewinding.\n",
                     ban_pos, banned_tok, result->text_to_send.c_str());
             }
 
@@ -3538,11 +4248,11 @@ inline void rewind_context(server_slot& slot, int32_t ban_pos) {
     }
 
     int32_t n_rewind_total = (slot.n_past + 1) - ban_pos;
-   
+
     size_t n_keep_cache = 0;
     if (ban_pos > 0) {
         n_keep_cache = (size_t)(ban_pos - 1);
-}
+    }
 
     if (n_keep_cache > slot.cache_tokens.size()) {
         n_keep_cache = slot.cache_tokens.size();
@@ -3551,15 +4261,15 @@ inline void rewind_context(server_slot& slot, int32_t ban_pos) {
     if (n_keep_cache < slot.cache_tokens.size()) {
         slot.sampled = slot.cache_tokens[n_keep_cache];
     } else {
-        slot.sampled = 0; 
+        slot.sampled = 0;
     }
 
     // Truncate cache
     slot.cache_tokens.keep_first(n_keep_cache);
     slot.n_past = slot.cache_tokens.n_tokens();
-    
+
     // Remove from KV cache
-    llama_kv_cache_seq_rm(slot.ctx, slot.id, slot.n_past, -1);
+    llama_kv_cache_seq_rm(slot.ctx, slot.id, slot.cache_tokens.pos_next(slot.n_past), -1);
 
     // Truncate buffer
     slot.token_buffer.resize(n_keep_buffer);
@@ -3595,13 +4305,13 @@ void server_context::buffer_and_check_string_ban(server_slot & slot, completion_
             // Automatic / Heuristic logic
             // Account for strings + regex + regex_ci
             size_t total_bans = slot.ban_phrases.size() + slot.ban_regex.size() + slot.ban_regex_ci.size();
-            
+
             // Heuristic: Allow if under 20 OR under 2 * total_bans
             // Conversely: Stop if >= 20 AND > 2 * total_bans
             if (slot.rewind_count >= 20 && slot.rewind_count > 2 * total_bans) {
                 allow_rewind = false;
             }
-        } 
+        }
         else if (slot.rewind_count_max > 0) {
             // Strict limit logic
             if (slot.rewind_count >= slot.rewind_count_max) {
@@ -3618,7 +4328,7 @@ void server_context::buffer_and_check_string_ban(server_slot & slot, completion_
     else if (buffer_full || !next_token) {
         slot.rewind_status = false;
         slot.rewind_count = 0;
-        
+
         if (!next_token) {
             // send all remaining tokens
             send_token_results(slot.token_buffer, slot);
@@ -3630,7 +4340,26 @@ void server_context::buffer_and_check_string_ban(server_slot & slot, completion_
     }
     else {
         // buffer the result, wait for more tokens to validate string
-        slot.sampled = result.tok; 
+        slot.sampled = result.tok;
+    }
+}
+
+void server_context::update_allowlist_state(server_slot& slot) {
+    const auto& kws = slot.allow_kws;
+    auto& idx = slot.allow_idx;
+    if ((slot.allow_kw_delay > slot.n_decoded) || (idx >= kws.size())) {
+        return;
+    }
+
+    // search for keyword
+    auto kw = kws[idx];
+    auto pos = slot.generated_text.find(kw, std::max(0, slot.last_gentxt_size - (int32_t)kw.length() + 1));
+    while (pos != std::string::npos) {
+        if (++idx >= kws.size()) {
+            break;
+        }
+        kw = kws[idx];
+        pos = slot.generated_text.find(kw, pos + 1);
     }
 }
 
@@ -3669,8 +4398,14 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 for (auto& slot : slots) {
                     slot.state = SLOT_STATE_PROCESSING;
                     slot.command = SLOT_COMMAND_NONE;
-                    slot.release();
-                    if (ret != user_cancel) {
+                    if (ret == user_cancel) {
+                        llama_pos cur_pos = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
+                        slot.n_past = slot.cache_tokens.size_up_to_pos(cur_pos + 1);
+                        slot.cache_tokens.keep_first(slot.n_past);
+                        slot.release();
+                    }
+                    else {
+                        slot.release();
                         LLAMA_LOG_INFO("n_past = %d\n", (int)slot.cache_tokens.size());
                         send_error(slot, "Input prompt is too big compared to KV size. Please try increasing KV size.");
                     }
@@ -3690,29 +4425,22 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             continue; // continue loop of n_batch
         }
 
-        bool mtp_warmup_needed = false;
-        std::vector<float> batch_mtp_hidden_state;
-        if (params_base.has_mtp) {
-            for (auto& slot : slots) {
-                if ((slot.state == SLOT_STATE_PROCESSING && slot.n_decoded == 0) ||
-                    (slot.state == SLOT_STATE_IDLE && slot.command == SLOT_COMMAND_LOAD_PROMPT)) {
-                    bool has_tokens_for_slot = (batch_view.n_tokens > 0 && batch_view.n_seq_id[0] > 0 && batch_view.seq_id[0][0] == slot.id);
-                    if (has_tokens_for_slot) {
-                        mtp_warmup_needed = true;
-                        break;
-                    }
-                }
+    if (params_base.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP)) {
+        for (auto & slot : slots) {
+            if (!slot.spec || !slot.uses_mtp()) {
+                continue;
             }
-            if (mtp_warmup_needed) {
-                const float* emb = llama_get_embeddings(ctx); 
-                const int n_embd = llama_model_n_embd(llama_get_model(ctx)); 
-                const int n_toks = batch_view.n_tokens;
-                if (emb) {
-                    batch_mtp_hidden_state.resize(n_toks * n_embd);
-                    memcpy(batch_mtp_hidden_state.data(), emb, n_toks * n_embd * sizeof(float));
-                }
+
+            if ((slot.state != SLOT_STATE_PROCESSING || slot.n_decoded != 0) &&
+                (slot.state != SLOT_STATE_IDLE || slot.command != SLOT_COMMAND_LOAD_PROMPT)) {
+                continue;
+            }
+
+            if (common_speculative_on_target_seq_batch(slot.spec, ctx, batch_view, slot.id, true) != 0) {
+                LOG_ERROR("failed to warm up MTP state from prompt batch for slot %d\n", slot.id);
             }
         }
+    }
 
         for (auto& slot : slots) {
             bool is_active_slot = (slot.state == SLOT_STATE_PROCESSING);
@@ -3738,7 +4466,11 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             }
 
             if (slot.n_decoded == 0 && slot.can_speculate()) {
-                common_speculative_begin(slot.spec, slot.cache_tokens.get_text_tokens());
+                static const llama_tokens empty_prompt;
+                const llama_tokens & spec_prompt = slot.uses_mtp() && !slot.params.speculative.has_composite_stage_chain()
+                    ? empty_prompt
+                    : slot.cache_tokens.get_text_tokens();
+                common_speculative_begin(slot.spec, spec_prompt);
             }
 
             if (slot.i_batch_dft.size() > 0) {
@@ -3754,21 +4486,32 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 }
             }
 
+            slot.ctx_sampling->to_generated_text = &slot.generated_text;
+
             completion_token_output result;
             const int tok_idx = slot.i_batch - i;
 
-            if (params_base.has_mtp && slot.n_decoded == 0) {
-                const float* emb_i = llama_get_embeddings_ith(ctx, tok_idx);
-                if (emb_i) {
-                    const int n_embd = llama_model_n_embd(llama_get_model(ctx));
-                    slot.mtp_hidden_state.resize(n_embd);
-                    memcpy(slot.mtp_hidden_state.data(), emb_i, n_embd * sizeof(float));
-                }
+            if (slot.uses_mtp() && slot.n_decoded == 0) {
+                (void) common_speculative_capture_output_hidden(slot.spec, ctx, tok_idx, slot.id, slot.n_past);
             }
 
-            const llama_token id = common_sampler_sample(slot.ctx_sampling, ctx, tok_idx);
+            apply_server_biases(slot);
 
-            common_sampler_accept(slot.ctx_sampling, ctx, id, true);
+            llama_token id;
+            try {
+                id = common_sampler_sample(slot.ctx_sampling, ctx, tok_idx);
+                common_sampler_accept(slot.ctx_sampling, ctx, id, true);
+            } catch (const std::exception & e) {
+                LOG_ERROR("sampling failed, releasing slot", {
+                    {"id_slot", slot.id},
+                    {"id_task", slot.id_task},
+                    {"error", e.what()},
+                });
+                send_error(slot, std::string("sampling error: ") + e.what(), ERROR_TYPE_SERVER);
+                slot.release();
+                slot.i_batch = -1;
+                continue;
+            }
 
             slot.n_decoded += 1;
             const int64_t t_current = ggml_time_us();
@@ -3809,13 +4552,10 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
             common_sampler_review(slot.ctx_sampling, slot.token_buffer.size(), slot.rewind_status);
 
+            update_allowlist_state(slot);
+
             slot.i_batch = -1;
         }
-        if (mtp_warmup_needed && !batch_mtp_hidden_state.empty()) {
-            llama_set_draft_input_hidden_state(ctx, batch_mtp_hidden_state.data());
-            mtp_update_kv_cache(ctx, batch_view, true);
-        }
-
         // speculative decoding - main model sample and accept
         speculative_decoding_accept();
     }
@@ -3845,11 +4585,11 @@ void server_context::update_slots() {
     // apply context-shift if needed
     // TODO: simplify and improve
     context_shift();
-    
+
     // start populating the batch for this iteration
     common_batch_clear(batch);
 
-    // frist, add sampled tokens from any ongoing sequences
+    // first, add sampled tokens from any ongoing sequences
     add_sampled_tokens(); // Prepare batch for inference
 
     // process in chunks of params.n_batch
@@ -3875,6 +4615,38 @@ void server_context::update_slots() {
 
     // make sure we're in the right embedding mode
     llama_set_embeddings(ctx, batch_type == 1);
+
+    if (llama_model_has_recurrent(model)) {
+        const int ckpt_mode = params_base.speculative.recurrent_ckpt_mode;
+
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch_dft.empty()) {
+                continue;
+            }
+            const int32_t n_pre_spec_tokens = slot.cache_tokens.n_tokens() - (int32_t) (slot.drafted.size() + 1);
+            const llama_pos n_past_pre_spec = slot.cache_tokens.pos_next(n_pre_spec_tokens);
+            const int max_tokens = (int) slot.drafted.size() + 1;
+            if (common_speculative_before_draft(
+                    slot.spec,
+                    model,
+                    ctx,
+                    slot.ctx_sampling,
+                    slot.sparams,
+                    slot.id,
+                    n_past_pre_spec,
+                    slot.sampled,
+                    max_tokens,
+                    ckpt_mode)) {
+                const common_speculative_checkpoint * ckpt = common_speculative_get_checkpoint(slot.spec);
+                GGML_ASSERT(ckpt != nullptr);
+                const char * mode_name = ckpt->per_step_enabled ? "per-step" : "shadow/cpu";
+                SLT_DBG(slot, "spec checkpoint saved (mode=%s), n_past_pre_spec=%d\n",
+                    mode_name, ckpt->n_past);
+            } else {
+                SLT_WRN(slot, "%s", "failed to save spec checkpoint\n");
+            }
+        }
+    }
 
     // process the created batch of tokens
     process_batch_tokens(n_batch); // Decode with batch

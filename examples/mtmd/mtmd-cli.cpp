@@ -99,6 +99,22 @@ void common_init() {
 #endif
 // ======================= end compat ================================
 
+static ggml_type ggml_type_from_str(const std::string & s) {
+    if (s == "f32") {
+        return GGML_TYPE_F32;
+    }
+    if (s == "f16") {
+        return GGML_TYPE_F16;
+    }
+    if (s == "bf16") {
+        return GGML_TYPE_BF16;
+    }
+    if (s == "q8_0") {
+        return GGML_TYPE_Q8_0;
+    }
+    throw std::runtime_error("Invalid cache type: " + s);
+}
+
 struct mtmd_cli_context {
     mtmd::context_ptr ctx_vision;
     common_init_result llama_init;
@@ -166,11 +182,14 @@ struct mtmd_cli_context {
         mtmd_context_params mparams = mtmd_context_params_default();
         mparams.use_gpu          = params.mmproj_use_gpu;
         mparams.print_timings    = true;
-        mparams.n_threads        = params.n_threads;
+        mparams.n_threads        = params.n_threads_mtmd != -1 ? params.n_threads_mtmd
+                                   : params.n_threads_batch != -1 ? params.n_threads_batch
+                                                                  : params.n_threads;
         mparams.verbosity        = params.verbosity > 0 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_INFO;
         mparams.flash_attn_type = params.flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
         mparams.image_min_tokens = params.image_min_tokens;
         mparams.image_max_tokens = params.image_max_tokens;
+        mparams.kq_type          = ggml_type_from_str(params.mtmd_kq_type);
         ctx_vision.reset(mtmd_init_from_file(clip_path, model, mparams));
         if (!ctx_vision.get()) {
             LOG_ERR("Failed to load vision model from %s\n", clip_path);
@@ -235,11 +254,11 @@ static int generate_response(mtmd_cli_context & ctx, int n_predict) {
     return 0;
 }
 
-static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg, bool add_bos = false) {
+static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg, bool add_bos = false, bool use_jinja = false) {
     common_chat_templates_inputs tmpl_inputs;
     tmpl_inputs.messages = {msg};
     tmpl_inputs.add_generation_prompt = true;
-    tmpl_inputs.use_jinja = false; // jinja is buggy here
+    tmpl_inputs.use_jinja = use_jinja; // jinja is buggy here
     auto formatted_chat = common_chat_templates_apply(ctx.tmpls.get(), tmpl_inputs);
     LOG_DBG("formatted_chat.prompt: %s\n", formatted_chat.prompt.c_str());
 
@@ -345,7 +364,7 @@ int main(int argc, char ** argv) {
                 return 1; // error is already printed by libmtmd
             }
         }
-        if (eval_message(ctx, msg, true)) {
+        if (eval_message(ctx, msg, true, params.use_jinja)) {
             return 1;
         }
         if (!g_is_interrupted && generate_response(ctx, n_predict)) {
@@ -410,7 +429,7 @@ int main(int argc, char ** argv) {
             common_chat_msg msg;
             msg.role = "user";
             msg.content = content;
-            int ret = eval_message(ctx, msg, is_first_msg);
+            int ret = eval_message(ctx, msg, is_first_msg, params.use_jinja);
             if (ret) {
                 return 1;
             }

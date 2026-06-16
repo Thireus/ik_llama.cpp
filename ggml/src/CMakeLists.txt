@@ -264,6 +264,7 @@ if (GGML_IQK_MUL_MAT)
     set(GGML_SOURCES_IQK_MM iqk/iqk_mul_mat.cpp
                             iqk/iqk_flash_attn.cpp
                             iqk/fa/iqk_fa_576_512.cpp
+                            iqk/fa/iqk_fa_512_512.cpp
                             iqk/fa/iqk_fa_320_256.cpp
                             iqk/fa/iqk_fa_192_128.cpp
                             iqk/fa/iqk_fa_192_192.cpp
@@ -360,7 +361,11 @@ if (GGML_CUDA)
                 endif()
     
                 if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
-                    list(APPEND ARCH_LIST "120-real")
+                    list(APPEND ARCH_LIST "120a-real")
+                endif()
+    
+                if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
+                    list(APPEND ARCH_LIST "121a-real")
                 endif()
     
                 set(CMAKE_CUDA_ARCHITECTURES ${ARCH_LIST})

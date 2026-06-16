@@ -503,7 +503,7 @@ static void * ggml_metal_host_malloc(size_t n) {
 static struct ggml_backend_metal_context * ggml_metal_init(int n_cb) {
     GGML_METAL_LOG_INFO("%s: allocating\n", __func__);
 
-#if TARGET_OS_OSX && !GGML_METAL_NDEBUG
+#if TARGET_OS_OSX // && !GGML_METAL_NDEBUG
     // Show all the Metal device instances in the system
     NSArray * devices = MTLCopyAllDevices();
     for (id<MTLDevice> device in devices) {

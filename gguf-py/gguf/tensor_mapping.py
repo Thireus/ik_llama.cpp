@@ -214,6 +214,10 @@ class TensorNameMap:
             "model.layers.{bid}.post_attention_layernorm",     # gemma2
         ),
 
+        MODEL_TENSOR.ATTN_GATE: (
+            "model.layers.{bid}.self_attn.g_proj",              # laguna
+        ),
+
         # Rotary embeddings
         MODEL_TENSOR.ATTN_ROT_EMBD: (
             "model.layers.{bid}.self_attn.rotary_emb.inv_freq",        # llama-hf
@@ -245,10 +249,22 @@ class TensorNameMap:
             "model.layers.{bid}.pre_feedforward_layernorm", # gemma2
         ),
 
+        MODEL_TENSOR.FFN_PRE_NORM_2: (
+            "model.layers.{bid}.pre_feedforward_layernorm_2", # gemma4
+        ),
+
         # Post feed-forward norm
         MODEL_TENSOR.FFN_POST_NORM: (
             "model.layers.{bid}.post_feedforward_layernorm", # gemma2
             "model.layers.{bid}.post_moe_norm",              # grok-2
+        ),
+
+        MODEL_TENSOR.FFN_POST_NORM_1: (
+            "model.layers.{bid}.post_feedforward_layernorm_1", # gemma4
+        ),
+
+        MODEL_TENSOR.FFN_POST_NORM_2: (
+            "model.layers.{bid}.post_feedforward_layernorm_2", # gemma4
         ),
 
         MODEL_TENSOR.FFN_GATE_INP: (
@@ -268,6 +284,8 @@ class TensorNameMap:
             "model.layers.{bid}.mlp.moe_statics.e_score_correction",    # ernie4.5-moe
             "model.layers.{bid}.mlp.gate.expert_bias",                  # bailingmoe2
             "model.layers.{bid}.block_sparse_moe.e_score_correction",   # minimax-m2
+            "model.layers.{bid}.mlp.experts.e_score_correction_bias",   # laguna
+            "model.layers.{bid}.mlp.experts.e_score_correction",        # laguna
         ),
 
         # Feed-forward up
@@ -303,6 +321,11 @@ class TensorNameMap:
             "transformer.decoder_layer.{bid}.moe.linear_v",  # Grok (merged)
             "transformer.blocks.{bid}.ffn.experts.mlp.v1",   # dbrx
             "model.layers.{bid}.mlp.experts.up_proj",        # qwen2moe (merged)
+        ),
+
+        MODEL_TENSOR.FFN_GATE_UP_EXP: (
+            "model.layers.{bid}.mlp.experts.gate_up_proj", # gemma4
+            "model.layers.{bid}.experts.gate_up_proj",     # gemma4
         ),
 
         MODEL_TENSOR.FFN_UP_SHEXP: (
@@ -411,6 +434,34 @@ class TensorNameMap:
             "encoder.layer.{bid}.mlp.layernorm",            # jina-bert-v2
             "encoder.layer.{bid}.layer_norm_2"              # jina-v2-code
             "model.layers.{bid}.final_layernorm",           # bailingmoe2
+        ),
+
+        MODEL_TENSOR.LAYER_OUT_SCALE: (
+            "model.layers.{bid}.layer_scalar", # gemma4
+        ),
+
+        MODEL_TENSOR.PER_LAYER_TOKEN_EMBD: (
+            "model.embed_tokens_per_layer", # gemma4
+        ),
+
+        MODEL_TENSOR.PER_LAYER_MODEL_PROJ: (
+            "model.per_layer_model_projection", # gemma4
+        ),
+
+        MODEL_TENSOR.PER_LAYER_PROJ_NORM: (
+            "model.per_layer_projection_norm", # gemma4
+        ),
+
+        MODEL_TENSOR.PER_LAYER_INP_GATE: (
+            "model.layers.{bid}.per_layer_input_gate", # gemma4
+        ),
+
+        MODEL_TENSOR.PER_LAYER_PROJ: (
+            "model.layers.{bid}.per_layer_projection", # gemma4
+        ),
+
+        MODEL_TENSOR.PER_LAYER_POST_NORM: (
+            "model.layers.{bid}.post_per_layer_input_norm", # gemma4
         ),
 
         MODEL_TENSOR.SSM_IN: (

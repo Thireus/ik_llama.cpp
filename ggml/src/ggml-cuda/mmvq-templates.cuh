@@ -66,7 +66,7 @@ static constexpr __device__ int get_vdr_mmvq(ggml_type type) {
 }
 
 template <ggml_type type, int ncols_y, int nwarps>
-static __device__ void mul_mat_vec_q(
+static __device__ void k_mul_mat_vec_q(
     const void * __restrict__ vx, const void * __restrict__ vy,
     const float * bias, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
@@ -150,7 +150,7 @@ static __device__ void mul_mat_vec_q(
 }
 
 template <ggml_type type, int ncols_y, int nwarps>
-static __device__ void fused_mul_mat_vec_q(
+static __device__ void k_fused_mul_mat_vec_q(
     const void * __restrict__ vup, const void * __restrict__ vgate,
     const float * __restrict__ bias_u, const float * __restrict__ bias_g,
     const void * __restrict__ vy, float * __restrict__ dst,
@@ -242,6 +242,13 @@ static __device__ void fused_mul_mat_vec_q(
             float u = tmp_u[j][threadIdx.x];
             float g = tmp_g[j][threadIdx.x];
             float r;
+            if (unary_op == GGML_UNARY_OP_SWIGLU_OAI && !bias_u) {
+                constexpr float alpha = 1.702f;
+                constexpr float limit = 7.0f;
+                g = fminf(g, limit);
+                u = fmaxf(fminf(u, limit), -limit);
+                r = g / (1.0f + expf(-g * alpha)) * (1.0f + u);
+            } else {
             switch (unary_op) {
                 case GGML_UNARY_OP_SILU:
                     {
@@ -265,6 +272,7 @@ static __device__ void fused_mul_mat_vec_q(
                   u = fmaxf(fminf(u, limit), -limit);
                   r = g / (1.0f + expf(-g * alpha)) * (1.0f + u);
                 } break;
+            }
             }
             dst[j*nrows_dst + row0 + threadIdx.x] = r;
         }
@@ -291,7 +299,7 @@ static __global__ void mul_mat_vec_q(
     const char * cx = (const char *)vx + i02*nb02;
     const char * cy = (const char *)vy + i2*nb12;
     const float * b = (const float *)(bias ? ids_data ? (const char *)bias + i02*bias_nb1 : bias : nullptr);
-    mul_mat_vec_q<type, ncols_y, nwarps>(cx, cy, b, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst);
+    k_mul_mat_vec_q<type, ncols_y, nwarps>(cx, cy, b, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst);
 }
 
 template <ggml_type type, int ncols_y, int nwarps>
@@ -317,7 +325,7 @@ static __global__ void fused_mul_mat_vec_q(
     const float * cx_u_b = bias_u ? (const float *)((const char *)bias_u + i02*bias_nb1) : nullptr;
     const float * cx_g_b = bias_g ? (const float *)((const char *)bias_g + i02*bias_nb1) : nullptr;
     const char * cy = (const char *)vy + i2*nb12;
-    fused_mul_mat_vec_q<type, ncols_y, nwarps>(cx_u, cx_g, cx_u_b, cx_g_b, cy, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst,
+    k_fused_mul_mat_vec_q<type, ncols_y, nwarps>(cx_u, cx_g, cx_u_b, cx_g_b, cy, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst,
             unary_op, limit);
 }
 
