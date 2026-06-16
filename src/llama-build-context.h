@@ -24,7 +24,7 @@ enum llm_ffn_op_type {
     LLM_FFN_RELU,
     LLM_FFN_RELU_SQR,
     LLM_FFN_SWIGLU,
-    LLM_FFN_SWIGLU_OAI_MOE,
+    LLM_FFN_SWIGLU_OAI,
 };
 
 enum llm_ffn_gate_type {
@@ -208,6 +208,8 @@ struct llm_build_context {
 
     ggml_cgraph * build_qwen3moe();
 
+    ggml_cgraph * build_mellum();
+
     ggml_cgraph * build_qwen3vlmoe();
 
     ggml_cgraph * build_qwen3next();
@@ -285,6 +287,7 @@ struct llm_build_context {
     ggml_cgraph * build_bitnet_158();
 
     ggml_cgraph * build_cohere2();
+    ggml_cgraph * build_cohere2_moe();
 
     ggml_cgraph * build_t5_encoder();
 
@@ -309,12 +312,15 @@ struct llm_build_context {
     ggml_cgraph * build_bailingmoe2();
 
     ggml_cgraph * build_minimaxm2();
+    ggml_cgraph * build_minimaxm3();
 
     ggml_cgraph * build_smollm3();
 
     ggml_cgraph * build_mimo2();
 
     ggml_cgraph * build_seedoss();
+
+    ggml_cgraph * build_laguna();
 
     ggml_cgraph * build_step35();
 
@@ -449,7 +455,7 @@ llm_expert_gating_func_type   gating_op,
             llm_ffn_op_type   type_op_shexp,
          const llm_build_cb & cb, int il, ggml_cgraph * graph, bool add_input = false,
          ggml_tensor * up_gate_exps = nullptr, ggml_tensor * up_gate_exps_b = nullptr,
-         ggml_tensor * shexp_gate = nullptr);
+         ggml_tensor * shexp_gate = nullptr, ggml_tensor * add_extra = nullptr);
 
     static ggml_cgraph * llama_build_graph_defrag(llama_context & lctx, const std::vector<uint32_t> & ids);
 
@@ -486,6 +492,14 @@ llm_expert_gating_func_type   gating_op,
         struct ggml_tensor * rope_cache
     );
 
+    struct ggml_tensor * build_deepseek2_mtp(
+        const struct llama_layer & mtp_layer,
+        struct ggml_tensor * prev_embeddings,
+        struct ggml_cgraph * gf,
+        struct ggml_tensor * inp_pos,
+        struct ggml_tensor * rope_cache
+    );
+
     struct ggml_tensor * build_qwen35_mtp(
         const struct llama_layer & mtp_layer,
         struct ggml_tensor * prev_embeddings,
@@ -501,4 +515,6 @@ llm_expert_gating_func_type   gating_op,
         struct ggml_cgraph * gf,
         struct ggml_tensor * inp_pos
     );
+
+    ggml_cgraph * new_graph_custom();
 };
