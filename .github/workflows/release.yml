@@ -305,7 +305,7 @@ jobs:
           name: llama-${{ steps.tag.outputs.name }}-bin-ubuntu-vulkan-${{ matrix.build }}-${{ matrix.instr }}.zip
 
   ubuntu-22-cuda:
-    #if: false
+    if: false
     strategy:
       matrix:
         cuda: ['12.8', '13.3'] # '11.7',
@@ -959,7 +959,7 @@ jobs:
           name: cudart-llama-${{ steps.tag.outputs.name }}-bin-win-cuda-${{ matrix.cuda }}-x64-${{ matrix.instr }}.zip
 
   windows-cuda-clang:
-    #if: false
+    if: false
     runs-on: windows-2022
 
     strategy:
@@ -1568,6 +1568,7 @@ jobs:
       #- windows-hip
       - ubuntu-22-cpu
       #- ubuntu-22-vulkan
+      #- ubuntu-22-cuda
       - macOS-arm64
       - macOS-x64
       #- ios-xcode-build
