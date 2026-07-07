@@ -85,9 +85,13 @@ class Model:
         self.use_temp_file = use_temp_file
         self.lazy = not eager
         self.part_names = Model.get_model_part_names(self.dir_model, "model", ".safetensors")
+        if len(self.part_names) == 0:
+            self.part_names = Model.get_model_part_names_from_weight_map(self.dir_model, "model.safetensors.index.json")
         self.is_safetensors = len(self.part_names) > 0
         if not self.is_safetensors:
             self.part_names = Model.get_model_part_names(self.dir_model, "pytorch_model", ".bin")
+            if len(self.part_names) == 0:
+                self.part_names = Model.get_model_part_names_from_weight_map(self.dir_model, "pytorch_model.bin.index.json")
         self.hparams = Model.load_hparams(self.dir_model)
         self.block_count = self.find_hparam(["n_layers", "num_hidden_layers", "n_layer", "num_layers"])
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
@@ -458,6 +462,24 @@ class Model:
         return part_names
 
     @staticmethod
+    def get_model_part_names_from_weight_map(dir_model: Path, index_name: str) -> list[str]:
+        index_path = dir_model / index_name
+        if not index_path.exists():
+            return []
+
+        with open(index_path, "r", encoding="utf-8") as f:
+            index: dict[str, Any] = json.load(f)
+            weight_map = index.get("weight_map")
+            if weight_map is None or not isinstance(weight_map, dict):
+                raise ValueError(f"Can't load 'weight_map' from {index_name!r}")
+
+        part_names = sorted({str(part_name) for part_name in weight_map.values()})
+        # Only surface shards that exist on disk; a stale index.json would otherwise set
+        # is_safetensors=True and suppress the pytorch_model*.bin fallback.
+        part_names = [name for name in part_names if (dir_model / name).is_file()]
+        return part_names
+
+    @staticmethod
     def load_hparams(dir_model: Path):
         with open(dir_model / "config.json", "r", encoding="utf-8") as f:
             return json.load(f)
@@ -693,6 +715,9 @@ class Model:
         if chkhsh == "9dcf830ee9990cdbf78cc523a5f7bd9ad8f3f9890c2d3581d2785ad10f07049d":
             # ref: https://huggingface.co/JetBrains/Mellum2-12B-A2.5B-Base
             res = "mellum2"
+        if chkhsh == "ccc2ef013c104be7bae2965776d611e1d7a8a2a9c547dd93a682c9a9fc80352e":
+            # ref: https://huggingface.co/openai/gpt-oss-20b
+            res = "gpt-4o"
         if res is None:
             logger.warning("\n")
             logger.warning("**************************************************************************************")
@@ -2399,7 +2424,13 @@ class DFlashDraftModel(Qwen3Model):
         super().set_gguf_parameters()
 
         self.gguf_writer.add_causal_attention(False)
-        self.gguf_writer.add_rope_dimension_count(self.hparams.get("head_dim", 128))
+        # MiMo DFlash draft uses partial rotary (partial_rotary_factor=0.5): RoPE is applied to
+        # only head_dim*partial_rotary_factor dims, the rest are NoPE. Honoring it is required;
+        # otherwise the upper half of every head gets spurious position rotation it was never
+        # trained for, which roughly halves draft acceptance.
+        head_dim = self.hparams.get("head_dim", 128)
+        partial_rotary_factor = self.hparams.get("partial_rotary_factor", 1.0)
+        self.gguf_writer.add_rope_dimension_count(int(partial_rotary_factor * head_dim))
 
         rope_scaling = self.hparams.get("rope_scaling")
         if isinstance(rope_scaling, dict):
@@ -2427,6 +2458,15 @@ class DFlashDraftModel(Qwen3Model):
         arch = self.gguf_writer.arch
         dflash_cfg = self.hparams.get("dflash_config")
         dflash_cfg = dflash_cfg if isinstance(dflash_cfg, dict) else {}
+
+        if (backbone_rotary_base := dflash_cfg.get("backbone_rotary_base")) is not None:
+            self.gguf_writer.add_float32(f"{arch}.dflash.backbone_rotary_base", float(backbone_rotary_base))
+            logger.info("DFlashDraftModel: backbone_rotary_base=%s", backbone_rotary_base)
+
+        attention_value_scale = dflash_cfg.get("attention_value_scale", self.hparams.get("attention_value_scale"))
+        if attention_value_scale is not None:
+            self.gguf_writer.add_attention_value_scale(float(attention_value_scale))
+            logger.info("DFlashDraftModel: attention_value_scale=%s", attention_value_scale)
 
         def dflash_required_value(name: str) -> Any:
             if name in dflash_cfg:
@@ -2477,6 +2517,28 @@ class DFlashDraftModel(Qwen3Model):
 
         self.gguf_writer.add_uint32(f"{arch}.dflash.n_target_features", n_target_features)
 
+        # DFlash drafts may be trained with sliding-window attention (for long-context). When the
+        # source config enables it, emit the window size + the per-layer SWA pattern so the runtime
+        # activates the kq_mask_swa path. These drafts are typically all sliding-window except a
+        # final full-attention (global) layer, so honor layer_types when present; fall back to
+        # all-SWA only when it is absent. Absent/false use_sliding_window => dense draft (unchanged).
+        use_sliding_window = self.hparams.get("use_sliding_window")
+        sliding_window = self.hparams.get("sliding_window")
+        if use_sliding_window is None and "use_swa" in dflash_cfg:
+            use_sliding_window = bool(dflash_cfg["use_swa"])
+        if sliding_window is None and "swa_window_size" in dflash_cfg:
+            sliding_window = int(dflash_cfg["swa_window_size"])
+        if use_sliding_window and sliding_window:
+            n_swa_layers = int(self.hparams.get("num_hidden_layers", self.block_count))
+            layer_types = self.hparams.get("layer_types")
+            if layer_types:
+                swa_pattern = [str(t) == "sliding_attention" for t in layer_types]
+            else:
+                swa_pattern = [True] * n_swa_layers
+            self.gguf_writer.add_sliding_window(int(sliding_window))
+            self.gguf_writer.add_sliding_window_pattern(swa_pattern)
+            logger.info("DFlashDraftModel: sliding_window=%d, SWA pattern=%s", int(sliding_window), swa_pattern)
+
         logger.info(
             "DFlashDraftModel metadata: block_size=%s mask_token_id=%s target_layer_ids=%s n_target_features=%s",
             block_size,
@@ -2487,6 +2549,15 @@ class DFlashDraftModel(Qwen3Model):
 
     def prepare_tensors(self):
         super().prepare_tensors()
+
+        if sum(len(tensors) for tensors in self.gguf_writer.tensors) == 0:
+            raise ValueError(
+                "DFlashDraftModel conversion did not find any tensors. "
+                "DFlash drafts may share target token_embd/output tensors, but the draft "
+                "model must still provide its own block weights. Make sure the draft "
+                "directory contains downloaded model weights that this converter can discover, "
+                "such as model*.safetensors or pytorch_model*.bin; a metadata-only GGUF is not usable."
+            )
 
         if self._saw_output and not self._saw_token_embd:
             raise ValueError(
@@ -2515,8 +2586,14 @@ class DFlashDraftModel(Qwen3Model):
             return [(f"{gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DFLASH_FC]}.weight", data_torch)]
         if top_level_name == "hidden_norm.weight":
             return [(f"{gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DFLASH_HIDDEN_NORM]}.weight", data_torch)]
+        if top_level_name.endswith(".self_attn.attention_sink_bias"):
+            if bid is None:
+                raise ValueError(f"DFlashDraftModel: can not infer block id for tensor {name!r}")
+            return [(f"{gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.ATTN_SINKS].format(bid=bid)}.weight", data_torch)]
         if name == "norm.weight":
             name = "model.norm.weight"
+        elif name == "embed_tokens.weight":
+            name = "model.embed_tokens.weight"
         elif name.startswith("layers."):
             name = f"model.{name}"
 
@@ -5427,6 +5504,12 @@ class LagunaModel(Model):
         rope_params = hparams.get("rope_parameters", {})
         full_rope = rope_params.get("full_attention", rope_params)
         swa_rope = rope_params.get("sliding_attention", {})
+        # Laguna can specify different rotary widths for full-attention and SWA layers.
+        # M.1 uses the full-attention value from rope_parameters; XS.2 SWA omits the key
+        # because those layers rotate the whole head.
+        partial_rotary_factor = float(hparams.get("partial_rotary_factor", 1.0))
+        partial_rotary_factor_full = float(full_rope.get("partial_rotary_factor", partial_rotary_factor))
+        partial_rotary_factor_swa = float(swa_rope.get("partial_rotary_factor", 1.0))
 
         self.gguf_writer.add_context_length(int(hparams["max_position_embeddings"]))
         self.gguf_writer.add_embedding_length(int(hparams["hidden_size"]))
@@ -5443,8 +5526,11 @@ class LagunaModel(Model):
         self.gguf_writer.add_file_type(self.ftype)
 
         self.gguf_writer.add_sliding_window(int(hparams["sliding_window"]))
-        self.gguf_writer.add_rope_dimension_count(head_dim // 2)
-        self.gguf_writer.add_uint32(f"{arch}.rope.dimension_count_swa", head_dim)
+        # GGUF's rope.dimension_count is the number of scalar Q/K dimensions
+        # that ggml_rope_ext should rotate. It is not the number of RoPE pairs;
+        # the frequency table uses dimension_count / 2 entries later.
+        self.gguf_writer.add_rope_dimension_count(int(head_dim * partial_rotary_factor_full))
+        self.gguf_writer.add_uint32(f"{arch}.rope.dimension_count_swa", int(head_dim * partial_rotary_factor_swa))
         self.gguf_writer.add_rope_freq_base(float(full_rope.get("rope_theta", 500000.0)))
         self.gguf_writer.add_float32(f"{arch}.rope.freq_base_swa", float(swa_rope.get("rope_theta", 10000.0)))
         if full_rope.get("rope_type") == "yarn":
@@ -5454,7 +5540,9 @@ class LagunaModel(Model):
                 "original_max_position_embeddings",
                 rope_params.get("original_max_position_embeddings", hparams["max_position_embeddings"]),
             )))
-            self.gguf_writer.add_rope_scaling_yarn_ext_factor(float(full_rope.get("factor", 1.0)))
+            # GGUF's YaRN ext_factor is the config's extrapolation_factor. The main
+            # factor above is the context-extension scale and should not be mirrored here.
+            self.gguf_writer.add_rope_scaling_yarn_ext_factor(float(full_rope.get("extrapolation_factor", 1.0)))
             self.gguf_writer.add_rope_scaling_yarn_attn_factor(float(full_rope.get("attention_factor", 1.0)))
             self.gguf_writer.add_rope_scaling_yarn_beta_fast(float(full_rope.get("beta_fast", 32.0)))
             self.gguf_writer.add_rope_scaling_yarn_beta_slow(float(full_rope.get("beta_slow", 1.0)))

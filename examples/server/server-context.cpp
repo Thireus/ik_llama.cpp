@@ -1968,6 +1968,23 @@ void server_context::kv_cache_clear() {
     clean_kv_cache = false;
 }
 
+static inline int server_decode(llama_context * ctx, const llama_batch & batch) {
+#if 0
+    static int64_t tot_time = 0;
+    static int64_t ncalls   = 0;
+    auto tim1 = ggml_time_us();
+    int ret = llama_decode(ctx, batch);
+    llama_synchronize(ctx);
+    auto tim2 = ggml_time_us();
+    tot_time += tim2 - tim1;
+    ++ncalls;
+    LOG_INF("%s: %ld calls, %g ms, %g us/call\n", __func__, ncalls, 1e-3*tot_time, 1.*tot_time/ncalls);
+    return ret;
+#else
+    return llama_decode(ctx, batch);
+#endif
+}
+
 void server_context::system_prompt_update() {
     LOG_VERBOSE("system prompt update", {
         {"system_prompt", system_prompt},
@@ -1991,7 +2008,7 @@ void server_context::system_prompt_update() {
                 common_batch_add(batch, system_tokens[i + j], i + j, { 0 }, false);
             }
 
-            if (llama_decode(ctx, batch) != 0) {
+            if (server_decode(ctx, batch) != 0) {
                 LOG_ERROR("llama_decode() failed", {});
                 return;
             }
@@ -3369,7 +3386,7 @@ void server_context::context_shift() {
                     // we should never get here, because generation should already stopped in process_token()
                     slot.print_timings();
                     slot.release();
-                    send_error(slot, "context shift is disabled", ERROR_TYPE_SERVER);
+                    send_error(slot, "context_length_exceeded: the request exceeds the available context size; context shift is disabled", ERROR_TYPE_SERVER);
                     continue;
                 }
                 // Shift context
@@ -3577,6 +3594,51 @@ void server_context::apply_checkpoint(server_slot & slot) {
     }
 }
 
+static std::list<server_prompt_checkpoint>::iterator evict_checkpoint_by_variance(server_slot & slot, std::list<server_prompt_checkpoint> & ckpts) {
+    auto it = ckpts.begin();
+    if (ckpts.size() < 3) {
+        return it;
+    } else if (ckpts.size() == 3) {
+        std::advance(it, 1);
+        return it;
+    }
+    std::vector<int64_t> tokens;
+    tokens.reserve(ckpts.size());
+    for (const auto & ckpt : ckpts) {
+        tokens.push_back(int64_t(ckpt.pos_max));
+    }
+    // Remove the checkpoint that makes the distribution most even after removal.
+    // For each interior checkpoint, compute the variance of gaps that would result
+    // if it were removed. Pick the one with the lowest variance (most uniform spacing).
+    size_t best_idx = 1;
+    const size_t n = tokens.size();
+    const size_t start = 1;     // never remove the first
+    const size_t end = n - 1; // never remove the last
+    double max_pos =  tokens[n - 1];
+    // To avoid doing double for loop to calculate variance,
+    // We only need to find the one with the min product of two consecutive gaps.
+    // Why:
+    // Gap between checkpoints: x1, x2, .., x_n-1.
+    // The average is constant because first and last checkpoint is never removed
+    // Variance of the gap after removing i_th checkpoint is:
+    // x1^2+..+(x_n-1)^2+2*x_i*x_(i+1) - average^2
+    // Find the minimum variance is finding min { x_i*x_(i+1) }
+    double diff = (tokens[start] - tokens[start - 1]);
+    double diff2 = (tokens[start + 1] - tokens[start]);
+    double best_variance = diff * (diff2 / max_pos); 
+    for (size_t i = start+1; i < end; i++) {
+        diff = tokens[i] - tokens[i - 1];
+        diff2 = tokens[i + 1] - tokens[i];
+        double variance = diff  * (diff2 / max_pos);
+        if (variance < best_variance) {
+            best_variance = variance;
+            best_idx = i;
+        }
+    }
+    std::advance(it, best_idx);
+    return it;
+}
+
 bool server_context::create_checkpoint(server_slot & slot) {
     bool do_checkpoint = !slot.image_just_processed;
     int32_t pos_min = llama_kv_cache_seq_pos_min(slot.ctx, slot.id);
@@ -3592,12 +3654,15 @@ bool server_context::create_checkpoint(server_slot & slot) {
         const int64_t t_start = ggml_time_us();
         while (slot.server_cached_prompt.checkpoints.size() >= (size_t)params_base.ctx_checkpoints_n) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.server_cached_prompt.checkpoints.front();
-
+            auto it = slot.server_cached_prompt.checkpoints.begin();
+            if (params_base.ctx_checkpoint_eviction == COMMON_CHECKPOINT_EVICTION_VARIANCE ||
+                params_base.ctx_checkpoint_eviction == COMMON_CHECKPOINT_EVICTION_AUTO) {
+                it = evict_checkpoint_by_variance(slot, slot.server_cached_prompt.checkpoints);
+            } 
+            const auto & cur = *it;
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 cur.pos_min, cur.pos_max, cur.n_tokens, (float)cur.data.size() / 1024 / 1024);
-
-            slot.server_cached_prompt.checkpoints.erase(slot.server_cached_prompt.checkpoints.begin());
+            slot.server_cached_prompt.checkpoints.erase(it);
         }
 
         auto & cur = slot.server_cached_prompt.checkpoints.emplace_back();
@@ -3881,6 +3946,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
 
                     // add the image chunk to cache
                     {
+                        slot.prompt_tokens.free_raw_media_data(slot.n_past_prompt);
                         const auto& chunk = slot.prompt_tokens.find_chunk(slot.n_past_prompt);
                         slot.cache_tokens.push_back(chunk.get()); // copy
                     }
@@ -4414,7 +4480,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             0, 0, 0, // unused
         };
 
-        const int ret = llama_decode(ctx, batch_view);
+        const int ret = server_decode(ctx, batch_view);
         if (ret != 0) {
             if (n_batch == 1 || ret < 0) {
                 int user_cancel = -3;

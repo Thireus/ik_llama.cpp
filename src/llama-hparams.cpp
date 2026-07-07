@@ -55,33 +55,39 @@ static bool load_dflash_target_layer_ids(
         throw std::runtime_error(format("dflash: %s must be a uint32/int32 array", key.c_str()));
     }
 
-    const size_t n = gguf_get_arr_n(ml.meta, kid);
+    uint32_t n = 0;
+    ml.get_arr_n(key, n, true);
     if (n == 0) {
         throw std::runtime_error(format("dflash: %s must not be empty", key.c_str()));
     }
     if (n > 8) {
-        throw std::runtime_error(format("dflash: %s has %zu entries, max is 8", key.c_str(), n));
+        throw std::runtime_error(format("dflash: %s has %u entries, max is 8", key.c_str(), n));
     }
 
-    hparams.dflash_n_target_layers = (uint32_t) n;
+    hparams.dflash_n_target_layers = n;
     for (uint32_t & id : hparams.dflash_target_layer_ids) {
         id = 0;
     }
 
-    const void * data = gguf_get_arr_data(ml.meta, kid);
-    for (uint32_t i = 0; i < hparams.dflash_n_target_layers; ++i) {
-        if (type == GGUF_TYPE_INT32) {
-            const int32_t id = ((const int32_t *) data)[i];
-            if (id < 0) {
-                throw std::runtime_error(format("dflash: %s contains negative layer id %d", key.c_str(), id));
+    if (type == GGUF_TYPE_INT32) {
+        std::array<int32_t, 8> layer_ids = {};
+        ml.get_arr(key, layer_ids, true);
+        for (uint32_t i = 0; i < hparams.dflash_n_target_layers; ++i) {
+            if (layer_ids[i] < 0) {
+                throw std::runtime_error(format("dflash: %s contains negative layer id %d", key.c_str(), layer_ids[i]));
             }
-            hparams.dflash_target_layer_ids[i] = (uint32_t) id;
-        } else {
-            hparams.dflash_target_layer_ids[i] = ((const uint32_t *) data)[i];
+            hparams.dflash_target_layer_ids[i] = (uint32_t) layer_ids[i];
         }
+    } else {
+        std::array<uint32_t, 8> layer_ids = {};
+        ml.get_arr(key, layer_ids, true);
+        for (uint32_t i = 0; i < hparams.dflash_n_target_layers; ++i) {
+            hparams.dflash_target_layer_ids[i] = layer_ids[i];
+        }
+    }
 
+    for (uint32_t i = 0; i < hparams.dflash_n_target_layers; ++i) {
         const uint32_t id = hparams.dflash_target_layer_ids[i];
-
         for (uint32_t j = 0; j < i; ++j) {
             if (hparams.dflash_target_layer_ids[j] == id) {
                 throw std::runtime_error(format(
@@ -871,9 +877,9 @@ void llm_load_hparams(
                     ml.get_key(LLM_KV_MTP_CENTROID_COUNT,            hparams.mtp_num_centroids, false);
                     ml.get_key(LLM_KV_MTP_CENTROID_TOP_K,            hparams.mtp_centroid_top_k, false);
                 } else {
-                    ml.get_key("gemma4_assistant.n_embd_backbone", hparams.mtp_backbone_n_embd);
-                    ml.get_key("gemma4_assistant.n_centroids",     hparams.mtp_num_centroids, false);
-                    ml.get_key("gemma4_assistant.centroid_top_k",  hparams.mtp_centroid_top_k, false);
+                    ml.get_key("gemma4-assistant.embedding_length_out", hparams.mtp_backbone_n_embd);
+                    ml.get_key("gemma4-assistant.n_centroids",     hparams.mtp_num_centroids, false);
+                    ml.get_key("gemma4-assistant.centroid_top_k",  hparams.mtp_centroid_top_k, false);
                 }
                 ml.get_key(LLM_KV_MTP_USE_ORDERED_EMBEDDINGS,    hparams.mtp_use_ordered_embeddings, false);
 
@@ -893,10 +899,17 @@ void llm_load_hparams(
         case LLM_ARCH_DFLASH_DRAFT:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
-                ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE,        hparams.dflash_block_size, false);
-                ml.get_key(LLM_KV_DFLASH_MASK_TOKEN_ID,     hparams.dflash_mask_token_id, false);
-                ml.get_key(LLM_KV_DFLASH_N_TARGET_FEATURES, hparams.dflash_n_target_features, false);
+                ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE,              hparams.dflash_block_size, false);
+                ml.get_key(LLM_KV_DFLASH_MASK_TOKEN_ID,           hparams.dflash_mask_token_id, false);
+                ml.get_key(LLM_KV_DFLASH_N_TARGET_FEATURES,       hparams.dflash_n_target_features, false);
+                ml.get_key(LLM_KV_DFLASH_BACKBONE_ROTARY_BASE,    hparams.dflash_backbone_rotary_base, false);
                 load_dflash_target_layer_ids(ml, LLM_KV(model.arch)(LLM_KV_DFLASH_TARGET_LAYER_IDS), hparams, false);
+                ml.get_key(LLM_KV_ATTENTION_VALUE_SCALE, hparams.f_attn_v_scale, false);
+                // DFlash drafts may be trained with sliding-window attention (for long-context).
+                // Read the window + per-layer pattern so the SWA mask path activates; absent keys
+                // leave n_swa=0 / swa_layers all-zero (dense behavior, unchanged).
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+                ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer, false);
                 validate_dflash_hparams(hparams, model.arch);
 
                 hparams.n_layer_kv_from_start = hparams.n_layer;
@@ -1532,11 +1545,22 @@ void llm_load_hparams(
                     }
                 }
 
-                // GGUF stores the Poolside partial-rotary setting; the graph RoPE
-                // argument for full-attention Laguna layers follows the upstream
-                // Laguna loader and uses half of that count. SWA layers remain
-                // full-head rotary via n_rot_swa.
-                hparams.n_rot /= 2;
+                const bool found_rope_dim     = ml.get_key(LLM_KV_ROPE_DIMENSION_COUNT,     hparams.n_rot,     false);
+                const bool found_rope_dim_swa = ml.get_key(LLM_KV_ROPE_DIMENSION_COUNT_SWA, hparams.n_rot_swa, false);
+
+                // Laguna GGUFs store the number of scalar Q/K dimensions that ggml_rope_ext
+                // rotates. Correct files carry those values explicitly. Some early public
+                // XS.2 GGUFs omitted both keys, so fall back to the HF XS.2 layout only for
+                // missing metadata: full-attention layers rotate half the head, SWA layers
+                // rotate the full head. Explicit but wrong halved metadata still needs repair.
+                if (hparams.n_swa > 0) {
+                    if (!found_rope_dim) {
+                        hparams.n_rot = hparams.n_embd_head_k_full / 2;
+                    }
+                    if (!found_rope_dim_swa) {
+                        hparams.n_rot_swa = hparams.n_embd_head_k_swa;
+                    }
+                }
 
                 ml.get_key(LLM_KV_ROPE_SCALING_YARN_EXT_FACTOR, hparams.yarn_ext_factor, false);
                 ml.get_key(LLM_KV_ROPE_SCALING_YARN_ATTN_FACTOR, hparams.yarn_attn_factor, false);
@@ -1546,12 +1570,6 @@ void llm_load_hparams(
                 if (!ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_COUNT_PER_LAYER, hparams.rope_dim_per_layer, hparams.n_layer, false)) {
                     for (uint32_t i = 0; i < hparams.n_layer; ++i) {
                         hparams.rope_dim_per_layer[i] = hparams.swa_layers[i] ? hparams.n_rot_swa : hparams.n_rot;
-                    }
-                } else {
-                    for (uint32_t i = 0; i < hparams.n_layer; ++i) {
-                        if (!hparams.swa_layers[i]) {
-                            hparams.rope_dim_per_layer[i] /= 2;
-                        }
                     }
                 }
 
@@ -1564,6 +1582,14 @@ void llm_load_hparams(
             {
                 ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,     hparams.n_ff_exp);
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,    hparams.f_norm_rms_eps);
+                // GLM-DSA lightning-indexer k_norm is a (non-RMS) LayerNorm built via LLM_NORM,
+                // which uses hparams.f_norm_eps in ggml_norm(). The GGUF only carries the RMS eps,
+                // so f_norm_eps stays 0 and CPU ggml_norm aborts (GGML_ASSERT(eps > 0)). On CUDA
+                // the kernel does not assert (eps=0 is numerically tolerable), which is why the
+                // CPU attention path was never exercised. Mirror the RMS eps so the indexer
+                // LayerNorm gets a valid epsilon on all backends. (HF hardcodes 1e-6 for this
+                // LayerNorm, but 1e-6 vs 1e-5 is within 4-chunk PPL noise here, so keep the mirror.)
+                if (hparams.f_norm_eps <= 0.0f) hparams.f_norm_eps = hparams.f_norm_rms_eps;
                 ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, false);
 
                 // MoE parameters
@@ -1586,6 +1612,17 @@ void llm_load_hparams(
                 ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
                 ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
                 ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
+
+                // GLM-5.2 IndexShare: per-layer full/shared indexer map. "full" layers compute their own
+                // top-k; "shared" layers reuse the previous full layer's selection (transformers
+                // modeling_glm_moe_dsa.py: shared layer indexer=None, topk_indices=prev_topk_indices).
+                // Derived from GLM-5.2's config indexer_types rule (full iff il<=1 or il%4==2), verified
+                // to reproduce the config's full set {0,1,2,6,10,...} exactly. Existing GGUFs carry no
+                // per-layer metadata, so the derivation is the source of truth; a future metadata key can
+                // override this for GLM-DSA variants with a different pattern.
+                for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                    hparams.indexer_is_full[il] = (il <= 1) || (il % 4 == 2);
+                }
 
                 // Expert gating function (GLM-4.5 uses sigmoid)
                 ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);

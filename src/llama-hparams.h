@@ -126,6 +126,10 @@ struct llama_hparams {
     uint32_t indexer_n_head    = 0;
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
+    // GLM-5.2 IndexShare: per-layer full/shared indexer map. "full" layers compute their own lightning-
+    // indexer top-k; "shared" layers reuse the previous full layer's top-k. Populated from GGUF
+    // indexer_types metadata if present, else derived from the GLM-5.2 config rule at load time.
+    std::array<bool, LLAMA_MAX_LAYERS> indexer_is_full = {};
 
 	// qwen3vl deepstack
     uint32_t n_deepstack_layers = 0;
@@ -145,6 +149,7 @@ struct llama_hparams {
     uint32_t dflash_n_target_features = 0;
     uint32_t dflash_n_target_layers = 0;
     uint32_t dflash_target_layer_ids[8] = {};
+    float    dflash_backbone_rotary_base = 0.0f;
 
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggerganov/llama.cpp/pull/8141
@@ -217,6 +222,7 @@ struct llama_hparams {
         if (!is_float_close(this->f_residual_scale,      other.f_residual_scale,      EPSILON)) return true;
         if (!is_float_close(this->f_embedding_scale,     other.f_embedding_scale,     EPSILON)) return true;
         if (!is_float_close(this->f_attention_scale,     other.f_attention_scale,     EPSILON)) return true;
+        if (!is_float_close(this->f_attn_v_scale,        other.f_attn_v_scale,        EPSILON)) return true;
 
         return false;
     }

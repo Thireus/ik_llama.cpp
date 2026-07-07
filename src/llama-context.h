@@ -61,6 +61,12 @@ struct llama_kv_cache {
     std::vector<struct ggml_tensor *> v_l;
     std::vector<struct ggml_tensor *> s_l; // per layer recurrent state storage (Qwen3Next)
 
+    // DSA lightning-indexer key cache (GLM-5.2 / DeepSeek-V3.2). One per layer, MQA single
+    // head: [indexer_head_size, kv_size]. Mirrors k_l but stores the (Hadamard-rotated)
+    // indexer keys so a decoded token scores against ALL past indexer keys, not just the
+    // current batch. Empty unless the model has the DSA indexer.
+    std::vector<struct ggml_tensor *> kr_l;
+
     // When true, the delta_net graph builder will enable per-step SSM state saves
     bool save_per_step_ssm = false;
 
@@ -219,9 +225,6 @@ struct llama_context {
 #ifdef GGML_USE_METAL
     ggml_backend_t backend_metal = nullptr;
 #endif
-#ifdef GGML_USE_BLAS
-    ggml_backend_t backend_blas = nullptr;
-#endif
     ggml_backend_t backend_cpu = nullptr;
 
     bool has_evaluated_once = false;
@@ -304,10 +307,10 @@ struct llama_context {
         struct kv_runtime_state {
             std::vector<struct ggml_tensor *> k_ctx_cache;
             std::vector<struct ggml_tensor *> v_ctx_cache;
-            std::vector<struct ggml_tensor *> k_ctx_workspace;
-            std::vector<struct ggml_tensor *> v_ctx_workspace;
             struct ggml_context * cache_ctx = nullptr;
             std::vector<ggml_backend_buffer_t> cache_bufs;
+            std::vector<llama_pos> cache_pos;
+            std::vector<uint8_t> cache_slot_valid;
             int32_t cache_write_pos = 0;
             int32_t cache_n_filled = 0;
             int32_t cache_update_rows = 0;
@@ -317,28 +320,16 @@ struct llama_context {
             uint64_t cache_applied_window_version = 0;
             bool cache_valid = false;
             bool cache_view_valid = false;
-            int32_t workspace_write_pos = 0;
-            int32_t workspace_n_filled = 0;
-            int32_t workspace_reserved_rows = 0;
-            int32_t workspace_token_capacity = 0;
-            int32_t workspace_n_kv_total = 0;
-            uint64_t workspace_applied_window_version = 0;
-            bool workspace_valid = false;
-            bool workspace_sync_pending = false;
             std::vector<uint8_t> cache_compute_meta;
-            std::vector<uint8_t> workspace_compute_meta;
             ggml_backend_sched_t cache_sched = nullptr;
-            ggml_backend_sched_t workspace_sched = nullptr;
             ggml_cgraph * cache_graph = nullptr;
-            ggml_cgraph * workspace_graph = nullptr;
             int32_t cache_graph_rows = 0;
             int32_t cache_graph_write_pos = 0;
-            int32_t workspace_graph_rows = 0;
-            int32_t workspace_graph_write_pos = 0;
             struct ggml_tensor * cache_input_target_features = nullptr;
             struct ggml_tensor * cache_input_pos_ctx = nullptr;
             struct ggml_tensor * kq_mask_tensor = nullptr;
             struct ggml_tensor * kq_mask_swa_tensor = nullptr;
+            struct ggml_tensor * draft_tail_rows_tensor = nullptr;
         };
 
         struct capture_state {
@@ -393,6 +384,8 @@ struct llama_context {
     struct ggml_tensor * inp_KQ_mask_cross; // F32 [n_outputs_enc, n_batch]
     struct ggml_tensor * inp_scale = nullptr; // F32 [n_tokens]
     struct ggml_tensor * inp_mtp_states = nullptr;
+    struct ggml_tensor * inp_dsa_sink = nullptr; // F32 [n_kv, n_tokens] per-sequence attention-sink boost for DSA indexer top-k
+    struct ggml_tensor * inp_mask_inf = nullptr;
 
     ggml_backend_t ggml_backend_by_name(const char * name);
 
@@ -408,6 +401,14 @@ struct llama_context {
         size_t        step = 0;
     };
     std::vector<CacheCopy> cache_copies;
+    // GLM-DSA lightning indexer: the indexer-key cache (kr_l) write is a separate ggml_cpy that
+    // the K/V cache_copies fixup does NOT cover. Under graph reuse (FA pads KV to 256, so n_kv
+    // stays constant across consecutive decode ubatches and the graph IS reused) its view_offs
+    // would stay baked at the first ubatch's kv_head, scattering this ubatch's indexer keys to a
+    // stale slot. Later ubatches never populate their own recent index-key cells (those cells read
+    // uninitialized -> wrong block-max-pool/top-k -> degraded/NaN sparse-FA decode). Register the
+    // kr_l cpy per layer here and patch its offset in update_cache_copies(), exactly like K/V.
+    std::vector<CacheCopy> dsa_cache_copies;
 
     bool update_cache_copies();
 
@@ -419,5 +420,4 @@ struct llama_context {
     void set_mtp_op_type(llama_mtp_op_type value);
 
     int max_nodes(int n_tokens, int n_kv) const;
-
 };

@@ -97,6 +97,13 @@ struct llm_build_context {
 
     struct ggml_context * ctx0 = nullptr;
 
+    // GLM-5.2 IndexShare: the most-recent "full" indexer layer's top-k selection (argsort indices).
+    // "shared" layers reuse this instead of computing their own. Reset to nullptr at each graph build.
+    struct ggml_tensor * dsa_last_full_sorted = nullptr;
+    struct ggml_tensor * last_sparse_mask_fa  = nullptr;
+    struct ggml_tensor * last_sparse_mask     = nullptr;
+    struct ggml_tensor * dsa_tg_fast_mask     = nullptr;
+
     // TODO: consider making the entire interface noexcept
     llm_build_context(
         llama_context  & lctx,
@@ -251,8 +258,6 @@ struct llm_build_context {
 
     ggml_cgraph * build_dflash_kv_cache();
 
-    ggml_cgraph * build_dflash_kv_workspace();
-
     ggml_cgraph * build_starcoder2();
 
     ggml_cgraph * build_mamba();
@@ -288,6 +293,27 @@ struct llm_build_context {
             bool use_f32_attn_precision,
             bool is_lite,
             bool pp_opt);
+
+    // DSA lightning indexer (GLM-5.2 / DeepSeek-V3.2). Cache-backed (persistent indexer-key cache).
+    // Returns the FULL descending argsort of the per-query indexer scores [n_kv, n_tokens] (I32).
+    ggml_tensor * build_deepseek2_dsa_indexer(
+            ggml_cgraph * gf,
+            int il,
+            ggml_tensor * qr,       // q_lora latent [q_lora_rank, n_tokens] (after attn_q_a_norm)
+            ggml_tensor * cur,      // attn_norm output [n_embd, n_tokens]
+            ggml_tensor * KQ_mask,  // F32 causal mask [n_kv, n_tokens_pad]
+            ggml_tensor * inp_pos);
+
+    // Build the additive sparse causal mask from the full score ranking + the base causal KQ_mask.
+    ggml_tensor * build_deepseek2_dsa_sparse_mask(
+            ggml_tensor * sorted,   // [n_kv, n_tokens] (I32) full descending argsort of scores
+            ggml_tensor * KQ_mask); // F32 causal mask [n_kv, n_tokens_pad]
+
+    // Adapt the (F32, unpadded) sparse mask to the shape/dtype ggml_flash_attn_ext requires on this
+    // fork: F16, contiguous, ne[1] padded to GGML_KQ_MASK_PAD (== the dense KQ_mask's padded shape).
+    ggml_tensor * build_deepseek2_dsa_fa_mask(
+            ggml_tensor * sparse,   // [n_kv, n_tokens] (F32) additive sparse causal mask
+            ggml_tensor * KQ_mask); // FA dense mask [n_kv, n_tokens_pad] (F16 when -fa 1)
 
     ggml_cgraph * build_glm4_moe();
 
@@ -473,8 +499,6 @@ llm_expert_gating_func_type   gating_op,
     static ggml_cgraph * llama_build_graph_s_copy(llama_context & lctx);
 
     static ggml_cgraph * llama_build_graph_dflash_kv_cache(llama_context & lctx);
-
-    static ggml_cgraph * llama_build_graph_dflash_kv_workspace(llama_context & lctx);
 
     static ggml_cgraph * llama_build_graph(llama_context & lctx, const llama_batch & batch, bool worst_case, int n_outputs = 0);
 

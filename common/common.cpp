@@ -498,6 +498,18 @@ common_webui common_webui_from_name(const std::string& format) {
     }
 }
 
+common_checkpoint_eviction common_checkpoint_eviction_from_name(const std::string & format) {
+    if (format == "auto") {
+        return COMMON_CHECKPOINT_EVICTION_AUTO;
+    } else if (format == "fifo") {
+        return COMMON_CHECKPOINT_EVICTION_FIFO;
+    } else if (format == "variance") {
+        return COMMON_CHECKPOINT_EVICTION_VARIANCE;
+    } else {
+        return COMMON_CHECKPOINT_EVICTION_AUTO;
+    }
+}
+
 thinking_tokens thinking_tokens_from_string(const std::string& format) {
     thinking_tokens think_token;
     std::string token_string = string_strip(format);
@@ -1782,6 +1794,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.cache_type_v = argv[++i];
         return true;
     }
+    if (arg == "-ictk" || arg == "--indexer-cache-type-k") {
+        params.indexer_cache_type_k = argv[++i];
+        return true;
+    }
     if (arg == "-ctk-first" || arg == "--cache-type-k-first") {
         CHECK_ARG
         auto p = string_split(argv[i], ",");
@@ -1878,6 +1894,15 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "-mla" || arg == "--mla-use") {
         CHECK_ARG
         params.mla_attn = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "-dsa" || arg == "--dsa") {
+        params.dsa = true;
+        return true;
+    }
+    if (arg == "-dsatk" || arg == "--dsa-top-k") {
+        CHECK_ARG
+        params.dsa_top_k = std::stoi(argv[i]);
         return true;
     }
     if (arg == "-amb" || arg == "--attention-max-batch") {
@@ -2772,6 +2797,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.ctx_checkpoints_tolerance = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "--ctx-checkpoints-eviction") {
+        CHECK_ARG
+        params.ctx_checkpoint_eviction= common_checkpoint_eviction_from_name(std::string(argv[i]));
+        return true;
+    }
     if (arg == "-cram" || arg == "--cache-ram") {
         CHECK_ARG
         params.cache_ram_mib = std::stoi(argv[i]);
@@ -2982,6 +3012,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "--ctx-checkpoints N",           "max number of context checkpoints to create per slot (default: %d)",params.ctx_checkpoints_n});
     options.push_back({ "*",           "--ctx-checkpoints-interval N",  "minimum number of tokens between each context checkpoint.  (default: %d, <=0 disable)",params.ctx_checkpoints_interval});
     options.push_back({ "*",           "--ctx-checkpoints-tolerance N", "the number of tokens before the full prompt to create the checkpoint.  (default: %d, <=0 disable)",params.ctx_checkpoints_tolerance});
+    options.push_back({ "*",           "--ctx-checkpoints-eviction NAME", "Eviction strategy for checkpoint. Accepts fifo, variance and auto. Auto defaults to variance. Variance preserves coverage and maintains uniform interval.  (default: variance)" });
     options.push_back({ "*",           "-cram, --cache-ram N",          "set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)",params.cache_ram_mib });
     options.push_back({ "*",           "-crs,  --cache-ram-similarity N",           "max of similarity of prompt tokens to cache tokens that triggers prompt cache (default: %.2f).",params.cache_ram_similarity });
     options.push_back({ "*",           "-cram-n-min --cache-ram-n-min N",           "minimum number of the cached tokens that triggers prompt cache (default: %d).", params.cache_ram_n_min });
@@ -2993,6 +3024,8 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-no-fa, --no-flash-attn",       "disable Flash Attention (default: %s)", params.flash_attn ? "enabled" : "disabled" });
     options.push_back({ "*",           "-fa, --flash-attn (auto|on|off|0|1)", "set Flash Attention (default: %s)", params.flash_attn ? "on" : "off" });
     options.push_back({ "*",           "-mla,  --mla-use",              "enable MLA (default: %d)", params.mla_attn });
+    options.push_back({ "*",           "-dsa,  --dsa",                  "enable GLM DSA sparse attention (GLM-DSA arch only; default: %s)", params.dsa ? "enabled" : "disabled" });
+    options.push_back({ "*",           "-dsatk, --dsa-top-k",           "DSA top-k override; <0 uses the model's configured indexer_top_k (default: %d)", params.dsa_top_k });
     options.push_back({ "*",           "-amb,  --attention-max-batch",  "max batch size for attention computations (default: %d)", params.attn_max_batch});
     options.push_back({ "*",           "-no-fmoe, --no-fused-moe",      "disable fused MoE (default: %s)", params.fused_moe_up_gate ? "enabled" : "disabled" });
     options.push_back({ "*",           "-ger,  --grouped-expert-routing", "enable grouped expert routing (default: %s)", params.grouped_expert_routing ? "enabled" : "disabled" });
@@ -3155,6 +3188,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-dkvc, --dump-kv-cache",        "verbose print of the KV cache" });
     options.push_back({ "*",           "-nkvo, --no-kv-offload",        "disable KV offload" });
     options.push_back({ "*",           "-ctk,  --cache-type-k TYPE",    "KV cache data type for K (default: %s)", params.cache_type_k.c_str() });
+    options.push_back({ "*",           "-ictk, --indexer-cache-type-k TYPE", "indexer K-cache data type (default: %s)", params.indexer_cache_type_k.c_str() });
     options.push_back({ "*",           "-ctv,  --cache-type-v TYPE",    "KV cache data type for V (default: %s)", params.cache_type_v.c_str() });
     options.push_back({ "*",           "-ctk-first, --cache-type-k-first TYPE,N", "KV cache data type for the first N layers of K (default: %s,-1)", params.type_k_first.c_str() });
     options.push_back({ "*",           "-ctv-last,  --cache-type-k-last  TYPE,N", "KV cache data type for the last N layers of K  (default: %s,-1)", params.type_k_last.c_str() });
@@ -3187,7 +3221,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-nocb, --no-cont-batching",     "disable continuous batching" });
 
     options.push_back({ "multi-modality" });
-    options.push_back({ "*",           "       --mmproj FILE",          "path to a multimodal projector file for LLaVA. see examples/llava/README.md" });
+    options.push_back({ "*",           "       --mmproj FILE",          "path to a multimodal projector file. see examples/mtmd/README.md" });
     options.push_back({ "*",           "       --image FILE",           "path to an image file. use with multimodal models. Specify multiple times for batching" });
     options.push_back({ "*",           "       --image-min-tokens N",   "minimum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)"});
     options.push_back({ "*",           "       --image-max-tokens N",   "maximum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)" });
@@ -4132,6 +4166,7 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     mparams.worst_graph_tokens = params.worst_graph_tokens;
     mparams.type_k          = kv_cache_type_from_str(params.cache_type_k);
     mparams.type_v          = kv_cache_type_from_str(params.cache_type_v);
+    mparams.idx_type_k      = kv_cache_type_from_str(params.indexer_cache_type_k);
     mparams.type_k_first    = kv_cache_type_from_str(params.type_k_first);
     mparams.type_k_last     = kv_cache_type_from_str(params.type_k_last );
     mparams.type_v_first    = kv_cache_type_from_str(params.type_v_first);
@@ -4238,6 +4273,8 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.fused_mmad        = params.fused_mmad;
     cparams.rope_cache        = params.rope_cache;
     cparams.graph_reuse       = params.graph_reuse;
+    cparams.dsa               = params.dsa;
+    cparams.dsa_top_k         = params.dsa_top_k;
     cparams.k_cache_hadamard  = params.k_cache_hadamard;
     cparams.v_cache_hadamard  = params.v_cache_hadamard;
     cparams.split_mode_graph_scheduling = params.split_mode_graph_scheduling;
@@ -4252,6 +4289,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
 
     cparams.type_k = kv_cache_type_from_str(params.cache_type_k);
     cparams.type_v = kv_cache_type_from_str(params.cache_type_v);
+    cparams.idx_type_k = kv_cache_type_from_str(params.indexer_cache_type_k);
     cparams.type_reduce = ggml_type_from_str(params.reduce_type);
     cparams.type_graph_attn = ggml_type_from_str(params.graph_attn_precision);
     if (!cparams.flash_attn && ggml_is_quantized(cparams.type_v)) {
