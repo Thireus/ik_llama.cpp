@@ -2039,7 +2039,10 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                     ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
 
                     ggml_backend_synchronize(ids_backend);
-                    needs_sync[tensor_backend_id(ids_tensor)] = k_set_sync;
+                    if (auto id = tensor_backend_id(ids_tensor); id >= 0 && id < GGML_SCHED_MAX_BACKENDS) {
+                        needs_sync[id] = k_set_sync;
+                    }
+                    //needs_sync[tensor_backend_id(ids_tensor)] = k_set_sync;
 
                     unique_ids.resize((n_expert + 31)/32);
                     std::memset(unique_ids.data(), 0, unique_ids.size()*sizeof(uint32_t));
@@ -2127,7 +2130,7 @@ static ggml_status ggml_backend_sched_eval(ggml_backend_sched_t sched, ggml_back
             struct ggml_tensor * t = split->graph.nodes[j0];
 
             // check if the user needs data from this node
-            bool need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+            int need = sched->callback_eval(t, true, sched->callback_eval_user_data);
 
             int j1 = j0;
 
@@ -2150,7 +2153,9 @@ static ggml_status ggml_backend_sched_eval(ggml_backend_sched_t sched, ggml_back
             }
 
             // TODO: pass backend to the callback, then the user can decide if they want to synchronize
-            ggml_backend_synchronize(split_backend);
+            if (need == 1) {
+                ggml_backend_synchronize(split_backend);
+            }
 
             if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
                 break;

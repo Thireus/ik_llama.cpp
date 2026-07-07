@@ -21,11 +21,8 @@ void llama_reset_dflash_kv_cache_state(struct llama_context * ctx) {
     ctx->dflash.kv.cache_applied_window_version = 0;
     ctx->dflash.kv.cache_valid = false;
     ctx->dflash.kv.cache_view_valid = false;
-    ctx->dflash.kv.workspace_write_pos = 0;
-    ctx->dflash.kv.workspace_n_filled = 0;
-    ctx->dflash.kv.workspace_applied_window_version = 0;
-    ctx->dflash.kv.workspace_valid = false;
-    ctx->dflash.kv.workspace_sync_pending = false;
+    std::fill(ctx->dflash.kv.cache_pos.begin(), ctx->dflash.kv.cache_pos.end(), 0);
+    std::fill(ctx->dflash.kv.cache_slot_valid.begin(), ctx->dflash.kv.cache_slot_valid.end(), 0);
 
     for (ggml_backend_buffer_t buf : ctx->dflash.kv.cache_bufs) {
         if (buf != nullptr) {
@@ -118,7 +115,7 @@ int32_t llama_model_dflash_target_mask_token_id(const struct llama_model * model
     return (int32_t) model->vocab.token_mask();
 }
 
-const struct ggml_tensor * llama_model_dflash_output_tensor(
+static const ggml_tensor * llama_dflash_output_tensor(
         const struct llama_model * model) {
     if (model == nullptr) {
         return nullptr;
@@ -142,8 +139,8 @@ int32_t llama_model_dflash_io_mode(
         return LLAMA_DFLASH_IO_MODE_INVALID;
     }
 
-    const ggml_tensor * draft_output = llama_model_dflash_output_tensor(draft_model);
-    const ggml_tensor * target_output = llama_model_dflash_output_tensor(target_model);
+    const ggml_tensor * draft_output = llama_dflash_output_tensor(draft_model);
+    const ggml_tensor * target_output = llama_dflash_output_tensor(target_model);
     if (draft_model->tok_embd == nullptr || draft_output == nullptr || target_model->tok_embd == nullptr || target_output == nullptr) {
         return LLAMA_DFLASH_IO_MODE_INVALID;
     }
@@ -165,7 +162,7 @@ bool llama_model_dflash_io_tensors_match(
         const struct llama_model * draft_model,
         int32_t n_embd,
         int32_t n_vocab) {
-    const ggml_tensor * output = llama_model_dflash_output_tensor(draft_model);
+    const ggml_tensor * output = llama_dflash_output_tensor(draft_model);
     if (draft_model == nullptr || draft_model->tok_embd == nullptr || output == nullptr || n_embd <= 0 || n_vocab <= 0) {
         return false;
     }
@@ -202,11 +199,17 @@ bool llama_model_share_dflash_io_tensors(
     const bool uses_shared_output = draft_model->output == target_model->output ||
             draft_model->output == target_model->tok_embd;
 
-    if (draft_model->output_mtp == nullptr && target_model->output_mtp != nullptr && uses_shared_tok && uses_shared_output) {
-        draft_model->output_mtp = target_model->output_mtp;
+    if (draft_model->output_mtp == nullptr) {
+        if (target_model->output_mtp != nullptr && uses_shared_tok && uses_shared_output) {
+            draft_model->output_mtp = target_model->output_mtp;
+        } else if (draft_model->output != nullptr) {
+            draft_model->output_mtp = draft_model->output;
+        } else {
+            draft_model->output_mtp = draft_model->tok_embd;
+        }
     }
 
-    const struct ggml_tensor * output = llama_model_dflash_output_tensor(draft_model);
+    const struct ggml_tensor * output = llama_dflash_output_tensor(draft_model);
     return draft_model->tok_embd != nullptr && output != nullptr;
 }
 
@@ -365,7 +368,7 @@ static int32_t llama_dflash_find_layer_index(const struct llama_context * ctx, i
     return it == layer_ids.end() ? -1 : (int32_t) std::distance(layer_ids.begin(), it);
 }
 
-static bool llama_dflash_capture_eval_callback(struct ggml_tensor * tensor, bool ask, void * user_data) {
+static int llama_dflash_capture_eval_callback(struct ggml_tensor * tensor, bool ask, void * user_data) {
     auto * ctx = static_cast<llama_context *>(user_data);
     if (ctx == nullptr || !ctx->dflash.capture) {
         return false;
@@ -373,22 +376,24 @@ static bool llama_dflash_capture_eval_callback(struct ggml_tensor * tensor, bool
 
     int32_t layer_id = -1;
     if (!llama_dflash_parse_layer_id(tensor, layer_id)) {
-        return false;
+        return 0;
     }
 
     const int32_t layer_idx = llama_dflash_find_layer_index(ctx, layer_id);
     if (layer_idx < 0) {
-        return false;
+        return 0;
     }
 
+    //printf("%s -> %d, %d\n", tensor->name, layer_id, layer_idx);
+
     if (ask) {
-        return true;
+        return 2;
     }
 
     const int32_t row_width = (int32_t) tensor->ne[0];
     const int32_t row_count = row_width > 0 ? (int32_t) (ggml_nelements(tensor) / (int64_t) row_width) : 0;
     if (row_width <= 0 || row_count <= 0) {
-        return false;
+        return 0;
     }
 
     auto & capture = *ctx->dflash.capture;
@@ -401,11 +406,13 @@ static bool llama_dflash_capture_eval_callback(struct ggml_tensor * tensor, bool
 
     auto & rows = capture.layer_rows[(size_t) layer_idx];
     rows.resize((size_t) row_count * (size_t) row_width);
-    ggml_backend_tensor_get(tensor, rows.data(), 0, ggml_nbytes(tensor));
+    auto backend = ggml_backend_sched_get_tensor_backend(ctx->sched, tensor);
+    GGML_ASSERT(backend);
+    ggml_backend_tensor_get_async(backend, tensor, rows.data(), 0, ggml_nbytes(tensor));
     capture.row_width = row_width;
     capture.row_count = row_count;
     capture.layer_seen_batch_id[(size_t) layer_idx] = capture.capture_batch_id;
-    return true;
+    return 2;
 }
 
 bool llama_set_dflash_capture_layers(

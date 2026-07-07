@@ -240,7 +240,10 @@
 // if you need to load more than 64 model shards.
 #define GGML_MAX_CONTEXTS 2048 // Was 64, but I prefer to force it to 2048 on my fork just in case users forget to set -DGGML_MAX_CONTEXTS=2048 at compilation
 #endif
-#define GGML_MAX_SRC            12
+#ifndef GGML_MAX_SRC
+// For the machines with 11+ GPUs use -DGGML_MAX_SRC=N
+#define GGML_MAX_SRC            16
+#endif
 #ifndef GGML_MAX_NAME
 #define GGML_MAX_NAME           64
 #endif
@@ -700,6 +703,7 @@ extern "C" {
         GGML_OP_FAKE_CPY,
         GGML_OP_FUSED_NORM,
         GGML_OP_FUSED_RMS_RMS_ADD,
+        GGML_OP_BLEND,
 
         GGML_OP_COUNT,
     };
@@ -2389,6 +2393,14 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             float                 c);
+
+    // Overwrite values in a with c for the indeces stored in b
+    GGML_API struct ggml_tensor * ggml_blend(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 c);
+
 
     // sort rows
     enum ggml_sort_order {

@@ -127,7 +127,16 @@ enum common_webui {
     COMMON_WEBUI_LLAMACPP,
 };
 
+enum common_checkpoint_eviction {
+    COMMON_CHECKPOINT_EVICTION_AUTO,
+    COMMON_CHECKPOINT_EVICTION_FIFO,
+    COMMON_CHECKPOINT_EVICTION_VARIANCE
+};
+
 common_webui common_webui_from_name(const std::string& format);
+
+common_checkpoint_eviction common_checkpoint_eviction_from_name(const std::string & format);
+
 
 struct thinking_tokens {
     bool exclude = true;
@@ -408,6 +417,8 @@ struct gpt_params {
     bool grouped_expert_routing = false; // if to use grouped expert routing (BailingMoeV2 arch)
     bool rope_cache        = false; // if to use RoPE cache (for supported models)
     bool graph_reuse       = true;  // if to reuse compute graphs
+    bool dsa               = false; // enable GLM DSA sparse attention (off by default; opt-in via --dsa)
+    int  dsa_top_k         = -1;    // DSA top-k override (<0 => use the model's configured indexer_top_k)
     int  min_experts       = -1;
     float thresh_experts   = 0;
 
@@ -441,6 +452,7 @@ struct gpt_params {
 
     std::string cache_type_k = "f16"; // KV cache data type for the K
     std::string cache_type_v = "f16"; // KV cache data type for the V
+    std::string indexer_cache_type_k = "f16"; // indexer K-cache data type
 
     std::string reduce_type = "f16";
     std::string graph_attn_precision = "f16";
@@ -527,6 +539,7 @@ struct gpt_params {
     int32_t ctx_checkpoints_n = 32;           // max number of context checkpoints per slot
     int32_t ctx_checkpoints_interval = 512;   // minimum number of tokens between each context checkpoints
     int32_t ctx_checkpoints_tolerance = 5;    // the number of tokens before the full prompt to create the checkpoint
+    common_checkpoint_eviction ctx_checkpoint_eviction = COMMON_CHECKPOINT_EVICTION_VARIANCE;
     int32_t cache_ram_mib = 8192;   // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     int32_t cache_ram_n_min = 0;     // min number of tokens required to save in the ram
     float cache_ram_similarity = 0.5f; // similarity of tokens to cached tokens
