@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include <cstring>
 #include <climits>
@@ -435,6 +436,7 @@ struct llama_mmap::impl {
     }
 
     ~impl() {
+        ggml_backend_prefetch_unregister_mapping(addr);
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
                 LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
@@ -572,7 +574,7 @@ struct llama_mlock::impl {
         char* errmsg = std::strerror(errno);
         bool suggest = (errno == ENOMEM);
 #if defined(TARGET_OS_VISION) || defined(TARGET_OS_TV) || defined(_AIX)
-        // visionOS/tvOS dont't support RLIMIT_MEMLOCK
+        // visionOS/tvOS don't support RLIMIT_MEMLOCK
         // Skip resource limit checks on visionOS/tvOS
         suggest = false;
 #else

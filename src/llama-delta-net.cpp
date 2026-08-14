@@ -95,7 +95,9 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_co
     GGML_ASSERT(q->ne[0] == S_k && q->ne[2] == H_k && q->ne[1] == n_tokens && q->ne[3] == n_seqs);
     GGML_ASSERT(k->ne[0] == S_k && k->ne[2] == H_k && k->ne[1] == n_tokens && k->ne[3] == n_seqs);
     GGML_ASSERT(v->ne[2] == n_tokens);
-    GGML_ASSERT(g->ne[0] == H_v && g->ne[1] == n_tokens && g->ne[2] == n_seqs);
+    const bool scalar_gate = g->ne[0] == H_v && g->ne[1] == n_tokens && g->ne[2] == n_seqs;
+    const bool channel_gate = g->ne[0] == S_v && g->ne[1] == H_v && g->ne[2] == n_tokens && g->ne[3] == n_seqs;
+    GGML_ASSERT(scalar_gate || channel_gate);
     GGML_ASSERT(beta->ne[0] == H_v && beta->ne[2] == n_tokens && beta->ne[3] == n_seqs);
     GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H_v && state->ne[3] == n_seqs);
     //GGML_ASSERT(H_k == H_v);
@@ -109,7 +111,7 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_co
     cb(state,"state_in", il);
 
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
-    g = ggml_permute(ctx0, g, 2, 0, 3, 1);
+    g = channel_gate ? ggml_permute(ctx0, g, 1, 2, 0, 3) : ggml_permute(ctx0, g, 2, 0, 3, 1);
     beta = ggml_permute(ctx0, beta, 2, 0, 1, 3);
 
     ggml_tensor * state_flat = ggml_reshape_4d(ctx0, state, S_v, S_v * H_v, 1, n_seqs);
@@ -386,9 +388,19 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     cb(new_conv_states_cont, "new_conv_states_cont", il);
     ggml_tensor * new_conv_flat = ggml_reshape_2d(ctx0, new_conv_states_cont, conv_state_dim, 1);
     ggml_tensor * new_ssm_flat  = ggml_reshape_2d(ctx0, new_state, ssm_state_dim, 1);
-    auto state_cpy = ggml_concat_inplace(ctx0, new_conv_flat, new_ssm_flat, state_dst, 0);
-    cb(state_cpy, "state_cpy", il);
-    ggml_build_forward_expand(gf, state_cpy);
+    ggml_tensor * conv_state_dst = ggml_view_2d(ctx0, state_dst, conv_state_dim, 1, state_row_size, 0);
+    ggml_tensor * ssm_dst        = ggml_view_2d(ctx0, state_dst, ssm_state_dim, 1, state_row_size,
+            conv_state_dim * ggml_element_size(state_dst));
+
+    // expand this one first: ggml_delta_net_find_state_cpy() matches this copy only while nothing
+    // but view no-ops stands between it and the op, and the backends then write the slot directly
+    auto ssm_cpy = ggml_cpy(ctx0, new_ssm_flat, ssm_dst);
+    cb(ssm_cpy, "ssm_state_cpy", il);
+    ggml_build_forward_expand(gf, ssm_cpy);
+
+    auto conv_cpy = ggml_cpy(ctx0, new_conv_flat, conv_state_dst);
+    cb(conv_cpy, "conv_state_cpy", il);
+    ggml_build_forward_expand(gf, conv_cpy);
 
     return output;
 }

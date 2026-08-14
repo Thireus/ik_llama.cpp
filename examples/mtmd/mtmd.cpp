@@ -283,6 +283,11 @@ struct mtmd_context {
             img_beg = "<|vision_start|>";
             img_end = "<|vision_end|>";
 
+        } else if (proj == PROJECTOR_TYPE_MINIMAX_M3_VL) {
+            // ]<]start of image[>[ ... (image embeddings) ... ]<]end of image[>[
+            img_beg = "]<]start of image[>[";
+            img_end = "]<]end of image[>[";
+
         } else if (proj == PROJECTOR_TYPE_LLAMA4) {
             // (more details in mtmd_context constructor)
             img_beg = "<|image_start|>";
@@ -308,9 +313,17 @@ struct mtmd_context {
             //image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
         }
         else if (proj == PROJECTOR_TYPE_KIMIK25) {
-            // template renders: <|media_begin|>image<|media_content|> <pad/embeddings> <|media_end|>
-            img_beg = "<|media_begin|>image<|media_content|>";
-            img_end = "<|media_end|>";
+            // GLM-5.2-V reuses the Kimi-K2.5 vision encoder and projector, but marks
+            // images with its own tokens, so decide based on the text model vocab
+            if (lookup_token("<|begin_of_image|>") != LLAMA_TOKEN_NULL) {
+                // <|begin_of_image|> ... (image embeddings) ... <|end_of_image|>
+                img_beg = "<|begin_of_image|>";
+                img_end = "<|end_of_image|>";
+            } else {
+                // template renders: <|media_begin|>image<|media_content|> <pad/embeddings> <|media_end|>
+                img_beg = "<|media_begin|>image<|media_content|>";
+                img_end = "<|media_end|>";
+            }
         }
     }
 
@@ -573,7 +586,7 @@ struct mtmd_tokenizer {
                             if (!ctx->tok_sli_img_start.empty()) {
                                 add_text(ctx->tok_sli_img_start);
                             } else if (!ctx->sli_img_start_tmpl.empty()) {
-                                // If using a template to preceed a slice image
+                                // If using a template to precede a slice image
                                 const size_t sz = std::snprintf(nullptr, 0, ctx->sli_img_start_tmpl.c_str(), y+1, x+1) + 1;
                                 std::unique_ptr<char[]> buf(new char[sz]);
                                 std::snprintf(buf.get(), sz, ctx->sli_img_start_tmpl.c_str(), y+1, x+1);
@@ -1204,7 +1217,6 @@ void mtmd_input_chunk_to_json(mtmd_input_chunk * chunk, json & j) {
         }
     }
 }
-
 
 
 

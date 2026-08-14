@@ -53,6 +53,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_OPENELM,         "openelm"      },
     { LLM_ARCH_ARCTIC,          "arctic"       },
     { LLM_ARCH_DEEPSEEK2,       "deepseek2"    },
+    { LLM_ARCH_DEEPSEEK4,       "deepseek4"    },
     { LLM_ARCH_CHATGLM,         "chatglm"      },
     { LLM_ARCH_GLM4,            "glm4"         },
     { LLM_ARCH_GLM4_MOE,        "glm4moe"      },
@@ -72,6 +73,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_HUNYUAN_MOE,     "hunyuan-moe"  },
     { LLM_ARCH_OPENAI_MOE,      "gpt-oss"      },
     { LLM_ARCH_BAILINGMOE2,     "bailingmoe2"  },
+    { LLM_ARCH_BAILINGMOE3,     "bailingmoe3"  },
     { LLM_ARCH_MINIMAX_M2,      "minimax-m2"   },
     { LLM_ARCH_MINIMAX_M3,      "minimax-m3"   },
     { LLM_ARCH_SMOLLM3,         "smollm3"      },
@@ -84,8 +86,11 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_MISTRAL4,        "mistral4"     },
     { LLM_ARCH_GEMMA4,          "gemma4"       },
     { LLM_ARCH_GEMMA4_MTP,      "gemma4_mtp"   },
+    { LLM_ARCH_DFLASH,          "dflash"       },
     { LLM_ARCH_DFLASH_DRAFT,    "dflash-draft" },
     { LLM_ARCH_GEMMA4_ASSISTANT,"gemma4-assistant"   },
+    { LLM_ARCH_OPENPANGU,       "openpangu"    },
+    { LLM_ARCH_MUSE_GLIMMER,    "muse-glimmer" },
     { LLM_ARCH_UNKNOWN,         "(unknown)"    },
 };
 
@@ -125,6 +130,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_VOCAB_SIZE,                        "%s.vocab_size"                        },
     { LLM_KV_CONTEXT_LENGTH,                    "%s.context_length"                    },
     { LLM_KV_EMBEDDING_LENGTH,                  "%s.embedding_length"                  },
+    { LLM_KV_EMBEDDING_LENGTH_OUT,              "%s.embedding_length_out"              },
     { LLM_KV_EMBEDDING_LENGTH_PER_LAYER,        "%s.embedding_length_per_layer_input"  },
     { LLM_KV_BLOCK_COUNT,                       "%s.block_count"                       },
     { LLM_KV_LEADING_DENSE_BLOCK_COUNT,         "%s.leading_dense_block_count"         },
@@ -164,8 +170,10 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DFLASH_BLOCK_SIZE,                 "%s.dflash.block_size"                 },
     { LLM_KV_DFLASH_MASK_TOKEN_ID,              "%s.dflash.mask_token_id"              },
     { LLM_KV_DFLASH_TARGET_LAYER_IDS,           "%s.dflash.target_layer_ids"           },
+    { LLM_KV_DFLASH_TARGET_LAYERS,              "%s.target_layers"                      },
     { LLM_KV_DFLASH_N_TARGET_FEATURES,          "%s.dflash.n_target_features"          },
     { LLM_KV_DFLASH_BACKBONE_ROTARY_BASE,       "%s.dflash.backbone_rotary_base"       },
+    { LLM_KV_DFLASH_LAGUNA,                     "%s.dflash.laguna"                     },
 
     { LLM_KV_ATTENTION_HEAD_COUNT,             "%s.attention.head_count"             },
     { LLM_KV_ATTENTION_HEAD_COUNT_KV,          "%s.attention.head_count_kv"          },
@@ -190,11 +198,21 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,     "%s.attention.indexer.head_count"     },
     { LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,     "%s.attention.indexer.key_length"     },
     { LLM_KV_ATTENTION_INDEXER_TOP_K,          "%s.attention.indexer.top_k"          },
+    { LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,     "%s.attention.output_group_count"     },
+    { LLM_KV_ATTENTION_OUTPUT_LORA_RANK,       "%s.attention.output_lora_rank"       },
+    { LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,"%s.attention.compress_rope_freq_base"},
+    { LLM_KV_ATTENTION_COMPRESS_RATIOS,        "%s.attention.compress_ratios"        },
     { LLM_KV_FULL_ATTENTION_INTERVAL,          "%s.full_attention_interval"          },
     { LLM_KV_ATTENTION_SHARED_KV_LAYERS,       "%s.attention.shared_kv_layers"       },
     { LLM_KV_ATTENTION_KEY_LENGTH_SWA,         "%s.attention.key_length_swa"         },
     { LLM_KV_ATTENTION_VALUE_LENGTH_SWA,       "%s.attention.value_length_swa"       },
     { LLM_KV_ATTENTION_VALUE_SCALE,            "%s.attention.value_scale"            },
+
+    { LLM_KV_HYPER_CONNECTION_COUNT,               "%s.hyper_connection.count"               },
+    { LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, "%s.hyper_connection.sinkhorn_iterations" },
+    { LLM_KV_HYPER_CONNECTION_EPSILON,             "%s.hyper_connection.epsilon"             },
+
+    { LLM_KV_HASH_LAYER_COUNT,                 "%s.hash_layer_count"                },
 
     { LLM_KV_ROPE_DIMENSION_COUNT,          "%s.rope.dimension_count"                 },
     { LLM_KV_ROPE_DIMENSION_COUNT_SWA,      "%s.rope.dimension_count_swa"             },
@@ -224,6 +242,9 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_SSM_STATE_SIZE,                "%s.ssm.state_size"     },
     { LLM_KV_SSM_TIME_STEP_RANK,            "%s.ssm.time_step_rank" },
     { LLM_KV_SSM_GROUP_COUNT,               "%s.ssm.group_count"    },
+    { LLM_KV_KDA_HEAD_DIM,                  "%s.kda.head_dim"       },
+    { LLM_KV_KDA_SAFE_GATE,                 "%s.kda.safe_gate"      },
+    { LLM_KV_KDA_GATE_LOWER_BOUND,          "%s.kda.gate_lower_bound" },
 
     { LLM_KV_TOKENIZER_MODEL,                "tokenizer.ggml.model"                    },
     { LLM_KV_TOKENIZER_PRE,                  "tokenizer.ggml.pre"                      },
@@ -264,6 +285,10 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
 
     { LLM_KV_ADAPTER_TYPE,                  "adapter.type"       },
     { LLM_KV_ADAPTER_LORA_ALPHA,            "adapter.lora.alpha" },
+
+    { LLM_KV_OPENPANGU_MHC_NUM_STREAM,      "%s.mhc_num_stream"     },
+    { LLM_KV_OPENPANGU_MHC_RECUR_NORM,      "%s.mhc_recur_norm"     },
+    { LLM_KV_OPENPANGU_PARAM_SINK_NUMBER,   "%s.param_sink_number"  },
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char* suffix) : arch(arch), suffix(suffix) {}
@@ -295,8 +320,13 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
     case LLM_ARCH_QWEN3NEXT:
     case LLM_ARCH_QWEN35MOE:
     case LLM_ARCH_QWEN35:
+    case LLM_ARCH_BAILINGMOE3:
         return true;
     default:
         return false;
     }
+}
+
+bool llm_arch_is_dflash_family(const llm_arch & arch) {
+    return arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_DFLASH_DRAFT;
 }

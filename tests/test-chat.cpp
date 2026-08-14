@@ -355,7 +355,7 @@ static std::string renormalize_json(const std::string & json_str) {
         auto json_obj = json::parse(json_str);
         return json_obj.dump();
     } catch (const std::exception & e) {
-        return "";  // ignore parial JSON contents for comparison purposes
+        return "";  // ignore partial JSON contents for comparison purposes
     }
 }
 
@@ -4277,7 +4277,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                             },
                             "replaceAll": {
                                 "type": "boolean",
-                                "description": "Whether to replace all occurences."
+                                "description": "Whether to replace all occurrences."
                             }
                         },
                         "required": ["oldString", "newString"]

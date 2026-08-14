@@ -12,8 +12,6 @@
 #  include "ggml-vulkan.h"
 #elif defined(GGML_USE_SYCL)
 #  include "ggml-sycl.h"
-#elif defined(GGML_USE_KOMPUTE)
-#   include "ggml-kompute.h"
 #elif defined(GGML_USE_CANN)
 #   include "ggml-cann.h"
 #endif
@@ -855,6 +853,30 @@ bool llama_model_loader::get_key_or_arr(const enum llm_kv kid, T & result, uint3
     return get_key_or_arr(llm_kv(kid), result, n, required);
 }
 
+bool llama_model_loader::get_key_or_arr(enum llm_kv kid, uint32_t & result, bool required) {
+    const std::string key = llm_kv(kid);
+
+    const int id = gguf_find_key(meta, key.c_str());
+
+    if (id < 0) {
+        if (required) {
+            throw std::runtime_error(format("key not found in model: %s", key.c_str()));
+        }
+        return false;
+    }
+
+    // throw and error if type is an array
+    if (gguf_get_kv_type(meta, id) == GGUF_TYPE_ARRAY) {
+        if (required) {
+            throw std::runtime_error(format("expected scalar, found array for key: %s", key.c_str()));
+        }
+        return false;
+    }
+
+    return get_key(key, result, required);
+}
+
+
 const char * llama_model_loader::get_tensor_name(int i) const {
     return weights.at(i).tensor->name;
 }
@@ -1087,6 +1109,10 @@ bool llama_model_loader::load_all_data(
     std::vector<void*> host_ptrs;
     std::vector<ggml_backend_event_t> events;
 
+#if !defined(_WIN32)
+    std::vector<std::unique_ptr<llama_mmap>> split_mappings(files.size());
+#endif
+
     ggml_backend_t cuda_backend = nullptr;
     if (!use_mmap && !check_tensors) {
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
@@ -1206,6 +1232,24 @@ bool llama_model_loader::load_all_data(
         const char * buffer_name = ggml_backend_buffer_name(cur->buffer);
         const bool   is_probably_split_mode_graph = std::strncmp(buffer_name, GGML_CUDA_NAME, strlen(GGML_CUDA_NAME)) == 0;
         if (is_probably_split_mode_graph) {
+#if !defined(_WIN32)
+            llama_mmap * mapping;
+            {
+                std::lock_guard<std::mutex> lock(load_mutex);
+                auto & m = split_mappings[weight->idx];
+                if (!m) {
+                    m.reset(new llama_mmap(files.at(weight->idx).get(), 0, ggml_is_numa()));
+                }
+                mapping = m.get();
+            }
+            uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
+            ggml_backend_tensor_set(cur, data, 0, n_size);
+            if (check_tensors && !ggml_validate_row_data(cur->type, data, n_size)) {
+                throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+            }
+            mapping->dontneed_fragment(weight->offs, weight->offs + n_size);
+            return n_size;
+#else
             auto & read_buf = read_bufs[thread_idx];
             if (read_buf.capacity() > n_size) {
                 read_buf = std::vector<no_init<uint8_t>>();
@@ -1218,6 +1262,7 @@ bool llama_model_loader::load_all_data(
                 throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
             }
             return n_size;
+#endif
         }
 #endif
         // rest. Serialized.
@@ -1377,5 +1422,6 @@ template bool llama_model_loader::get_key_or_arr<std::array<float, 512>>(enum ll
 
 template std::enable_if<std::is_integral<unsigned int>::value, bool>::type llama_model_loader::get_arr_n<unsigned int>(const std::string &, unsigned int &, bool);
 template std::enable_if<std::is_integral<unsigned int>::value, bool>::type llama_model_loader::get_arr_n<unsigned int>(enum llm_kv, unsigned int&, bool);
+template bool llama_model_loader::get_arr<uint32_t>(const std::string &, std::vector<uint32_t> &, bool);
 template bool llama_model_loader::get_arr<int32_t, 8>(const std::string &, std::array<int32_t, 8> &, bool);
 template bool llama_model_loader::get_arr<uint32_t, 8>(const std::string &, std::array<uint32_t, 8> &, bool);

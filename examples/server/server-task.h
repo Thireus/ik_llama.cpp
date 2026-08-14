@@ -8,6 +8,8 @@
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 
+#include <vector>
+
 using json = nlohmann::ordered_json;
 
 enum stop_type {
@@ -130,6 +132,8 @@ struct result_timings {
     // Optional speculative metrics - only included when > 0
     int32_t draft_n = 0;
     int32_t draft_n_accepted = 0;
+    std::vector<int32_t> draft_n_by_depth;
+    std::vector<int32_t> draft_n_accepted_by_depth;
 
     json to_json() const;
 };
@@ -361,7 +365,7 @@ struct server_prompt_checkpoint {
         return data.size();
     }
 
-    json to_json() {
+    json to_json() const {
         json j;
         j["pos_min"] = pos_min;
         j["pos_max"] = pos_max;
@@ -408,7 +412,7 @@ struct server_prompt {
         };
     }
 
-    json to_json()
+    json to_json() const
     {
         json j;
         j["tokens"] = tokens.to_json();
@@ -421,7 +425,6 @@ struct server_prompt {
         tokens.from_json(j.at("tokens"));
         n_kept_prompt = j.value<llama_pos>("n_kept_prompt", 0);
         n_discarded_prompt = j.value<llama_pos>("n_discarded_prompt", 0);
-        n_kept_prompt = j.value<llama_pos>("n_kept_prompt", 0);
     }
 };
 
@@ -446,7 +449,7 @@ struct server_prompt_cache {
 
     server_prompt* alloc(const server_prompt& prompt, size_t state_size);
 
-    bool load(server_prompt& prompt, const server_tokens& tokens_new, llama_context* ctx, int32_t id_slot);
+    bool load(server_prompt& prompt, const server_tokens& tokens_new, llama_context* ctx, int32_t id_slot, float min_reusable_fraction);
 
     void update();
 };

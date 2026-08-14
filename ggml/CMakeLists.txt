@@ -82,7 +82,7 @@ option(GGML_CPU_HBM     "ggml: use memkind for CPU HBM" OFF)
 
 option(GGML_AVX         "ggml: enable AVX"              ${INS_ENB})
 option(GGML_AVX2        "ggml: enable AVX2"             ${INS_ENB})
-option(GGML_AVXVNNI     "ggml: enable AVX-VNNI"         ${INS_ENB})
+option(GGML_AVXVNNI     "ggml: enable AVX-VNNI"         OFF)
 option(GGML_AVX512      "ggml: enable AVX512"           OFF)
 option(GGML_AVX512_VBMI "ggml: enable AVX512-VBMI"      OFF)
 option(GGML_AVX512_VNNI "ggml: enable AVX512-VNNI"      OFF)
@@ -95,6 +95,7 @@ option(GGML_LASX        "ggml: enable lasx"             ON)
 option(GGML_LSX         "ggml: enable lsx"              ON)
 option(GGML_SVE         "ggml: enable SVE"              OFF)
 option(GGML_NCCL        "ggml: enable NCCL"             ON)
+option(GGML_EXPERT_CHUNKING "ggml: enable expert chunking" ON)
 
 if (WIN32)
     # Default to Windows 10 (0x0A00). Windows 8 / 8.1 reached end of support in
@@ -154,7 +155,6 @@ option(GGML_VULKAN_NO_COOPMAT               "ggml: don't use Vulkan coopmat even
 option(GGML_VULKAN_NO_COOPMAT2              "ggml: don't use Vulkan coopmat2 even if supported"      OFF)
 option(GGML_VULKAN_NO_BF16                  "ggml: don't use Vulkan bf16 even if supported"          OFF)
 option(GGML_VULKAN_NO_INT_DOT               "ggml: don't use Vulkan integer dot even if supported"   OFF)
-option(GGML_KOMPUTE                         "ggml: use Kompute"                               OFF)
 option(GGML_METAL                           "ggml: use Metal"                                 ${GGML_METAL_DEFAULT})
 option(GGML_METAL_NDEBUG                    "ggml: disable Metal debugging"                   OFF)
 option(GGML_METAL_SHADER_DEBUG              "ggml: compile Metal with -fno-fast-math"         OFF)
@@ -221,7 +221,6 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-cann.h
     include/ggml-cuda.h
     include/ggml.h
-    include/ggml-kompute.h
     include/ggml-metal.h
     include/ggml-rpc.h
     include/ggml-sycl.h

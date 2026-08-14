@@ -352,8 +352,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -mg, --main-gpu <i>                 (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>        (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <0|1>             (default: %s)\n", join(cmd_params_defaults.flash_attn, ",").c_str());
-    printf("  -mla, --mla-attn <0|1|2>            (default: %s)\n", join(cmd_params_defaults.mla_attn, ",").c_str());
-    printf("  -amb, --attn-max-batch <i>          (default: %s)\n", join(cmd_params_defaults.attn_max_batch, ",").c_str());
+    printf("  -mla, --mla-use <0|1|2>             (default: %s)\n", join(cmd_params_defaults.mla_attn, ",").c_str());
+    printf("  -amb, --attention-max-batch <i>     (default: %s)\n", join(cmd_params_defaults.attn_max_batch, ",").c_str());
     printf("  -ser, --smart-expert-reduction <i,f>(default: %s)\n", join(cmd_params_defaults.attn_max_batch, ",").c_str());
     printf("  -gr, --graph-reuse <0|1>            (default: %s)\n", join(cmd_params_defaults.reuse, ",").c_str());
     printf("  -mmp, --mmap <0|1>                  (default: %s)\n", join(cmd_params_defaults.use_mmap, ",").c_str());
@@ -702,14 +702,14 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
             }
             auto p = string_split<bool>(argv[i], split_delim);
             params.flash_attn.insert(params.flash_attn.end(), p.begin(), p.end());
-        } else if (arg == "-mla" || arg == "--mla-attn") {
+        } else if (arg == "-mla" || arg == "--mla-use" || arg == "--mla-attn") {
             if (++i >= argc) {
                 invalid_param = true;
                 break;
             }
             auto p = string_split<int>(argv[i], split_delim);
             params.mla_attn.insert(params.mla_attn.end(), p.begin(), p.end());
-        } else if (arg == "-amb" || arg == "--attn-max-batch") {
+        } else if (arg == "-amb" || arg == "--attention-max-batch" || arg == "--attn-max-batch") {
             if (++i >= argc) {
                 invalid_param = true;
                 break;
@@ -1288,7 +1288,6 @@ struct test {
     static const int build_number;
     static const bool cuda;
     static const bool vulkan;
-    static const bool kompute;
     static const bool metal;
     static const bool sycl;
     static const bool gpu_blas;
@@ -1454,9 +1453,6 @@ struct test {
         if (vulkan) {
             return "Vulkan";
         }
-        if (kompute) {
-            return "Kompute";
-        }
         if (metal) {
             return "Metal";
         }
@@ -1484,7 +1480,7 @@ struct test {
             field == "avg_ns" || field == "stddev_ns" || field == "max_gpu") {
             return INT;
         }
-        if (field == "cuda" || field == "vulkan" || field == "kompute" || field == "metal" ||
+        if (field == "cuda" || field == "vulkan" || field == "metal" ||
             field == "gpu_blas" || field == "blas" || field == "sycl" || field == "no_kv_offload" ||
             field == "flash_attn" || field == "use_mmap" || field == "embeddings" || field == "repack" || field == "use_thp" ||
             field == "fused_moe" || field == "grouped_er" || field == "no_fused_up_gate" || field == "no_ooae" || field == "mqkv" ||
@@ -1521,7 +1517,7 @@ struct test {
         bool is_gen = n_gen > 0;
         std::vector<std::string> values = {
             build_commit, std::to_string(build_number),
-            std::to_string(cuda), std::to_string(vulkan), std::to_string(kompute),
+            std::to_string(cuda), std::to_string(vulkan),
             std::to_string(metal), std::to_string(sycl), std::to_string(has_rpc), std::to_string(gpu_blas), std::to_string(blas),
             cpu_info, gpu_info,
             model_filename, model_type, std::to_string(model_size), std::to_string(model_n_params),
@@ -1546,7 +1542,7 @@ struct test {
     static const std::vector<std::string> & get_fields() {
         static const std::vector<std::string> fields = {
             "build_commit", "build_number",
-            "cuda", "vulkan", "kompute", "metal", "sycl", "rpc", "gpu_blas", "blas",
+            "cuda", "vulkan", "metal", "sycl", "rpc", "gpu_blas", "blas",
             "cpu_info", "gpu_info",
             "model_filename", "model_type", "model_size", "model_n_params",
             "n_batch", "n_ubatch",
@@ -1576,7 +1572,6 @@ const std::string test::build_commit = LLAMA_COMMIT;
 const int         test::build_number = LLAMA_BUILD_NUMBER;
 const bool        test::cuda         = !!ggml_cpu_has_cuda();
 const bool        test::vulkan       = !!ggml_cpu_has_vulkan();
-const bool        test::kompute      = !!ggml_cpu_has_kompute();
 const bool        test::metal        = !!ggml_cpu_has_metal();
 const bool        test::gpu_blas     = !!ggml_cpu_has_gpublas();
 const bool        test::blas         = !!ggml_cpu_has_blas();
