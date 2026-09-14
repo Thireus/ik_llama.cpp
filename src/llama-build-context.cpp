@@ -2730,6 +2730,7 @@ ggml_cgraph * llm_build_context::llama_build_graph(
     llm.init();
 
     switch (model.arch) {
+        case LLM_ARCH_K2_HORIZON:   // dense K2: same tensors + graph as llama
         case LLM_ARCH_LLAMA:
         case LLM_ARCH_LLAMA4:
         case LLM_ARCH_GRANITE:
@@ -3051,6 +3052,11 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             } break;
         default:
             GGML_ABORT("fatal error");
+    }
+
+    if (result == nullptr) {
+        llm.free();
+        return nullptr;
     }
 
     result->n_batch = llm.n_tokens;
