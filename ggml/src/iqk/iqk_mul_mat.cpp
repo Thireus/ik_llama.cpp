@@ -248,6 +248,7 @@ struct MulMat {
             case GGML_TYPE_IQ2_S  : return nrc_y >= 16 ? q8_k_type : type;
             case GGML_TYPE_IQ3_XXS: return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_IQ4_XS : return nrc_y >= 32 ? q8_k_type : type;
+            case GGML_TYPE_IQ4_XS_R8: return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_IQ3_S  : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_IQ1_S  : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_IQ1_M  : return nrc_y >= 32 ? q8_k_type : type;
@@ -268,6 +269,11 @@ struct MulMat {
             case GGML_TYPE_IQ5_K  : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_IQ6_K  : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_Q4_0   : return nrc_y >= 32 ? GGML_TYPE_Q8_0_R8 : type;
+            case GGML_TYPE_Q4_0_R8: return nrc_y >= 32 ? GGML_TYPE_Q8_0_R8 : type;
+            case GGML_TYPE_MXFP4_R8: return nrc_y >= 32 ? GGML_TYPE_Q8_0_R8 : type;
+            case GGML_TYPE_IQ4_NL_R4: return nrc_y >= 32 ? GGML_TYPE_Q8_0_R8 : type;
+            case GGML_TYPE_Q5_0_R4: return nrc_y >= 32 ? GGML_TYPE_Q8_0_R8 : type;
+            case GGML_TYPE_Q6_0_R4: return nrc_y >= 32 ? GGML_TYPE_Q8_0_R8 : type;
             case GGML_TYPE_Q4_1   : return nrc_y >= 32 ? GGML_TYPE_Q8_1    : type;
             case GGML_TYPE_Q5_0   : return nrc_y >= 32 ? GGML_TYPE_Q8_0_R8 : type;
             case GGML_TYPE_Q5_1   : return nrc_y >= 32 ? GGML_TYPE_Q8_1    : type;
@@ -425,7 +431,7 @@ bool iqk_convert_repack(int typeA, int n, const void * vx, size_t bx, void * vy,
         //case GGML_TYPE_Q4_K_R4:
         //case GGML_TYPE_Q5_K_R4:
         //case GGML_TYPE_Q6_K_R4:
-        //case GGML_TYPE_IQ4_XS_R8:
+        case GGML_TYPE_IQ4_XS_R8:
         //case GGML_TYPE_Q8_K_R8:
         //case GGML_TYPE_Q8_KV:
         //case GGML_TYPE_Q8_KV_R8:
@@ -472,11 +478,12 @@ bool iqk_convert_repack(int typeA, int n, const void * vx, size_t bx, void * vy,
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_MXFP4:
-        //case GGML_TYPE_Q4_0_R8:
-        //case GGML_TYPE_Q5_0_R4:
-        //case GGML_TYPE_Q6_0_R4:
+        case GGML_TYPE_Q4_0_R8:
+        case GGML_TYPE_MXFP4_R8:
+        case GGML_TYPE_Q5_0_R4:
+        case GGML_TYPE_Q6_0_R4:
         //case GGML_TYPE_Q8_0_R8:
-        //case GGML_TYPE_IQ4_NL_R4:
+        case GGML_TYPE_IQ4_NL_R4:
             return iqk_convert_legacy_quants_q8_r8(typeA, n, vx, bx, vy, nrc_x);
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ1_M:
@@ -1752,6 +1759,11 @@ size_t iqk_idx_topk_work_wbs_per_thread(const struct ggml_tensor * dst, int nth)
             auto row_size_q = ggml_row_size(tt.vec_dot_type, q->ne[0]);
             size = row_size_q * q->ne[1];
         }
+#ifdef __aarch64__
+        else if (k->type == GGML_TYPE_F16 && q->type == GGML_TYPE_F32) {
+            size = ggml_row_size(GGML_TYPE_F16, q->ne[0]) * q->ne[1];   // q is converted to f16 (no f16 x f32 kernel on arm)
+        }
+#endif
         size += k_indexer_chunks * q->ne[1] * sizeof(float);
         size += k->ne[1] * sizeof(float);
         size += k->ne[1] * sizeof(int32_t);
@@ -1874,6 +1886,7 @@ void iqk_bucket_topk(int nval, int ntop, float * values, int * idx, int * idx_in
         ++counts[i];
     }
 #else
+    for (int i = 0; i < nbucket; ++i) counts[i] = 0;
     for (int j = 0; j < ngood; ++j) {
         int i = int(av*values[j] + bv);
         i = std::min(i, nbucket-1);
@@ -1976,6 +1989,11 @@ size_t iqk_idx_topk_work_buffer_size(const struct ggml_tensor * dst, int nthread
         auto row_size_q = ggml_row_size(tt.vec_dot_type, q->ne[0]);
         size = row_size_q * q->ne[1] * q->ne[2];
     }
+#ifdef __aarch64__
+    else if (k->type == GGML_TYPE_F16 && q->type == GGML_TYPE_F32) {
+        size = ggml_row_size(GGML_TYPE_F16, q->ne[0]) * q->ne[1] * q->ne[2];
+    }
+#endif
     size += k->ne[1] * q->ne[1] * sizeof(float);
     size += k->ne[1] * sizeof(float);
     size += k->ne[1] * sizeof(int32_t);
@@ -2039,6 +2057,16 @@ bool iqk_indexer_topk(struct ggml_tensor * dst, void * work_buffer, barrier_t ba
         quantize_size = row_size_q * q->ne[1];
         q_type = tt.vec_dot_type;
     }
+#ifdef __aarch64__
+    else if (k_type == GGML_TYPE_F16 && q_type == GGML_TYPE_F32) {
+        // arm: iqk_set_kernels_float provides f16 x f16 but not f16 x f32; convert the q rows to f16
+        auto ttq = ggml_internal_get_type_traits(GGML_TYPE_F16);
+        from_float = ttq.from_float;
+        row_size_q = ggml_row_size(GGML_TYPE_F16, q->ne[0]);
+        quantize_size = row_size_q * q->ne[1];
+        q_type = GGML_TYPE_F16;
+    }
+#endif
 
     MulMat mm;
     if (!MulMat::prepare(int(k_type), int(q_type), k->ne[0], mm, q->ne[1])) {
