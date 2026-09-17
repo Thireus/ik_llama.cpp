@@ -284,6 +284,12 @@ bool server_context::load_model(const gpt_params& params_) {
 void server_context::init() {
     const int32_t n_ctx_slot = n_ctx / params_base.n_parallel;
 
+    const char * model_arch = llama_model_arch_string(model);
+    if (!params_base.use_jinja && model_arch != nullptr && std::string(model_arch) == "lfm2") {
+        params_base.use_jinja = true;
+        SRV_WRN("%s\n", "LFM2 model detected: enabling Jinja chat templates automatically");
+    }
+
     if (!system_prompt.empty() &&
         (llama_model_is_deepseek4(model) || llama_model_is_openpangu(model))) {
         throw std::runtime_error("server system prompts are unsupported for openPangu and DeepSeek4 because seq_cp does not copy private cache state");
@@ -3324,9 +3330,7 @@ void server_context::discard_n_kv_and_cache_tokens(llama_context* ctx, server_sl
     if (slot.spec) {
         common_speculative_context_shift(slot.spec, slot.id, kv_keep, kv_discard, kv_past);
     }
-    if (slot.params.cache_prompt) {
-        slot.cache_tokens.discard_n_tokens(n_keep, n_discard);
-    }
+    slot.cache_tokens.discard_n_tokens(n_keep, n_discard);
 }
 
 

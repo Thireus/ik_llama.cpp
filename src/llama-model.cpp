@@ -509,6 +509,28 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
         },
     },
     {
+        LLM_ARCH_LFM2,
+        {
+            { LLM_TENSOR_TOKEN_EMBD,          "token_embd" },
+            { LLM_TENSOR_TOKEN_EMBD_NORM,     "token_embd_norm" },
+            { LLM_TENSOR_OUTPUT,              "output" },
+            { LLM_TENSOR_ATTN_NORM,           "blk.%d.attn_norm" },
+            { LLM_TENSOR_ATTN_Q_NORM,         "blk.%d.attn_q_norm" },
+            { LLM_TENSOR_ATTN_K_NORM,         "blk.%d.attn_k_norm" },
+            { LLM_TENSOR_ATTN_Q,              "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_K,              "blk.%d.attn_k" },
+            { LLM_TENSOR_ATTN_V,              "blk.%d.attn_v" },
+            { LLM_TENSOR_ATTN_OUT,            "blk.%d.attn_output" },
+            { LLM_TENSOR_FFN_NORM,             "blk.%d.ffn_norm" },
+            { LLM_TENSOR_FFN_GATE,             "blk.%d.ffn_gate" },
+            { LLM_TENSOR_FFN_DOWN,             "blk.%d.ffn_down" },
+            { LLM_TENSOR_FFN_UP,               "blk.%d.ffn_up" },
+            { LLM_TENSOR_SHORTCONV_CONV,       "blk.%d.shortconv.conv" },
+            { LLM_TENSOR_SHORTCONV_INPROJ,     "blk.%d.shortconv.in_proj" },
+            { LLM_TENSOR_SHORTCONV_OUTPROJ,    "blk.%d.shortconv.out_proj" },
+        },
+    },
+    {
         LLM_ARCH_QWEN4EXP,
         {
             { LLM_TENSOR_TOKEN_EMBD,           "token_embd" },
@@ -2633,7 +2655,9 @@ bool llama_model_is_split_mode_graph(const struct llama_model * model) {
 
 bool llama_model_supports_ctx_shift(const struct llama_model * model) {
     // openPangu and DeepSeek4 keep position-dependent private state outside the generic KV cache.
-    return model && model->arch != LLM_ARCH_OPENPANGU && model->arch != LLM_ARCH_DEEPSEEK4;
+    // Gemma3 and Cohere2 vary rope geometry per layer without recording it in hparams.swa_layers.
+    return model && model->arch != LLM_ARCH_OPENPANGU && model->arch != LLM_ARCH_DEEPSEEK4
+        && model->arch != LLM_ARCH_GEMMA3 && model->arch != LLM_ARCH_COHERE2;
 }
 
 bool llama_model_supports_partial_kv_reuse(const struct llama_model * model) {
