@@ -108,6 +108,7 @@ std::pair<ggml_type, int> interleaved_properties(ggml_type type) {
         { GGML_TYPE_IQ3_K_R4,    { GGML_TYPE_IQ3_K, 4} },
         { GGML_TYPE_IQ4_K_R4,    { GGML_TYPE_IQ4_K, 4} },
         { GGML_TYPE_IQ4_KS_R4,   { GGML_TYPE_IQ4_KS, 4} },
+        { GGML_TYPE_IQ4_KS_R16,  { GGML_TYPE_IQ4_KS, 16} },
         { GGML_TYPE_IQ5_KS_R4,   { GGML_TYPE_IQ5_KS, 4} },
         { GGML_TYPE_IQ5_K_R4,    { GGML_TYPE_IQ5_K, 4} },
         { GGML_TYPE_MXFP4_R8,    { GGML_TYPE_MXFP4, 8} },
@@ -237,8 +238,9 @@ static ggml_type change_type_if_necessary(ggml_type new_type, int nx, int ny) {
         new_type == GGML_TYPE_IQ2_KT  || new_type == GGML_TYPE_IQ3_KT  || new_type == GGML_TYPE_IQ4_KT ||
         new_type == GGML_TYPE_IQ5_KS || new_type == GGML_TYPE_IQ5_KS_R4|| new_type == GGML_TYPE_IQ2_KL ||
         new_type == GGML_TYPE_IQ1_KT) {
-        if (nx % QK_K != 0) {
-            LLAMA_LOG_WARN("\n\n%s : tensor cols %d x %d are not divisible by %d, required for %s", __func__, nx, ny, QK_K, ggml_type_name(new_type));
+        const int blck = ggml_row_blck_size(new_type);
+        if (nx % blck != 0) {
+            LLAMA_LOG_WARN("\n\n%s : tensor cols %d x %d are not divisible by %d, required for %s", __func__, nx, ny, blck, ggml_type_name(new_type));
             convert_incompatible_tensor = true;
         }
     }
@@ -280,7 +282,7 @@ static ggml_type change_type_if_necessary(ggml_type new_type, int nx, int ny) {
             case GGML_TYPE_IQ2_KT:
             case GGML_TYPE_IQ3_KT:
             case GGML_TYPE_IQ4_KT:
-            case GGML_TYPE_IQ4_XS: new_type = GGML_TYPE_IQ4_NL; break;
+            case GGML_TYPE_IQ4_XS: new_type = ny % 16 == 0 ? GGML_TYPE_IQ4_KS_R16 : GGML_TYPE_IQ4_NL; break;
             case GGML_TYPE_IQ4_K:
             case GGML_TYPE_IQ4_K_R4:
             case GGML_TYPE_Q4_K_R4:
@@ -296,6 +298,9 @@ static ggml_type change_type_if_necessary(ggml_type new_type, int nx, int ny) {
             case GGML_TYPE_Q8_K_R8:
             case GGML_TYPE_Q6_K:   new_type = GGML_TYPE_Q8_0;   break;
             default: throw std::runtime_error("\nUnsupported tensor size encountered\n");
+        }
+        if (nx % ggml_row_blck_size(new_type) != 0) {
+            new_type = GGML_TYPE_F16;
         }
         LLAMA_LOG_WARN(" - using fallback quantization %s\n", ggml_type_name(new_type));
     }
@@ -1097,6 +1102,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         case LLAMA_FTYPE_MOSTLY_IQ4_KS:  default_type = GGML_TYPE_IQ4_KS;  break;
         case LLAMA_FTYPE_MOSTLY_IQ4_KS_R4:default_type = GGML_TYPE_IQ4_KS_R4;break;
         case LLAMA_FTYPE_MOSTLY_IQ5_KS_R4:default_type = GGML_TYPE_IQ5_KS_R4;break;
+        case LLAMA_FTYPE_MOSTLY_IQ4_KS_R16:default_type = GGML_TYPE_IQ4_KS_R16;break;
         case LLAMA_FTYPE_MOSTLY_IQ4_KSS: default_type = GGML_TYPE_IQ4_KSS; break;
         case LLAMA_FTYPE_MOSTLY_IQ5_KS:  default_type = GGML_TYPE_IQ5_KS;  break;
         case LLAMA_FTYPE_MOSTLY_IQ2_K:   default_type = GGML_TYPE_IQ2_K;   break;
