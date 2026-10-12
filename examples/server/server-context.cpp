@@ -776,10 +776,22 @@ result_timings server_slot::get_timings() const {
 const common_chat_msg& server_slot::update_chat_msg(bool is_partial, std::vector<common_chat_msg_diff>& diffs,
     bool filter_tool_calls) {
     auto msg_prv_copy = chat_msg;
-    auto new_msg = common_chat_parse(
-        generated_text,
-        /* is_partial= */ is_partial,
-        params.chat_parser_params);
+    common_chat_msg new_msg;
+    try {
+        new_msg = common_chat_parse(
+            generated_text,
+            /* is_partial= */ is_partial,
+            params.chat_parser_params);
+    } catch (const std::exception & e) {
+        // An output the chat parser rejects must not kill the server. Surface it as content so
+        // the request still completes with what the model generated.
+        LOG_ERROR("chat parse failed, returning raw text", {
+            {"id_slot", id},
+            {"error",   e.what()},
+        });
+        new_msg.role    = "assistant";
+        new_msg.content = generated_text;
+    }
     if (!new_msg.empty()) {
         //new_msg.ensure_tool_call_ids_set(generated_tool_call_ids, gen_tool_call_id);
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
@@ -2790,11 +2802,7 @@ static size_t save_checkpoints_to_file(const std::string & filename, const std::
     for (const auto & checkpoint : checkpoints) {
         file.write(reinterpret_cast<const char *>(&checkpoint.pos_min), sizeof(checkpoint.pos_min));
         file.write(reinterpret_cast<const char *>(&checkpoint.pos_max), sizeof(checkpoint.pos_max));
-        // Save the legacy fields from old file format
-        llama_pos pos_min_prompt = 0;
-        llama_pos pos_max_prompt = 0;
-        file.write(reinterpret_cast<const char *>(&pos_min_prompt), sizeof(pos_min_prompt));
-        file.write(reinterpret_cast<const char *>(&pos_max_prompt), sizeof(pos_max_prompt));
+        file.write(reinterpret_cast<const char *>(&checkpoint.n_tokens), sizeof(checkpoint.n_tokens));
         size_t data_len = checkpoint.data.size();
         file.write(reinterpret_cast<const char *>(&data_len), sizeof(data_len));
         if (data_len > 0) {
@@ -2833,11 +2841,10 @@ static size_t load_checkpoints_from_file(const std::string & filename, std::list
             server_prompt_checkpoint checkpoint;
             file.read(reinterpret_cast<char *>(&checkpoint.pos_min), sizeof(checkpoint.pos_min));
             file.read(reinterpret_cast<char *>(&checkpoint.pos_max), sizeof(checkpoint.pos_max));
-            // Read and discard legacy fields from old file format
-            llama_pos pos_min_prompt = 0;
-            llama_pos pos_max_prompt = 0;
-            file.read(reinterpret_cast<char *>(&pos_min_prompt), sizeof(pos_min_prompt));
-            file.read(reinterpret_cast<char *>(&pos_max_prompt), sizeof(pos_max_prompt));
+            // n_tokens occupies the same 8-byte slot as the old-format legacy
+            // pos_min_prompt/pos_max_prompt pair; files saved before this change
+            // read back n_tokens = 0
+            file.read(reinterpret_cast<char *>(&checkpoint.n_tokens), sizeof(checkpoint.n_tokens));
 
             size_t data_len;
             file.read(reinterpret_cast<char *>(&data_len), sizeof(data_len));

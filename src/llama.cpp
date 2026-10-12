@@ -450,6 +450,8 @@ static size_t llama_get_device_count(const llama_model & model, int initial_coun
     count = ggml_backend_vk_get_device_count();
 #elif defined(GGML_USE_CANN)
     return ggml_backend_cann_get_device_count();
+#elif defined(GGML_USE_METAL)
+    count = 1;
 #endif
 #if defined(GGML_USE_RPC)
     count += model.rpc_servers.size();
@@ -553,6 +555,11 @@ static size_t llama_get_device_memory(const llama_model & model, int device) {
     size_t total;
     size_t free;
     ggml_backend_cann_get_device_memory(device, &free, &total);
+    return free;
+#elif defined(GGML_USE_METAL)
+    size_t total;
+    size_t free;
+    ggml_backend_metal_get_device_memory(&free, &total);
     return free;
 #else
     // CPU-only build: report free host RAM instead of the 1-byte placeholder.
@@ -5182,7 +5189,7 @@ static bool llm_load_tensors(
                     throw std::runtime_error("unable to allocate backend buffer");
                 }
                 model.bufs.push_back(buf);
-                if (use_mlock && ggml_backend_buffer_is_host(buf)) {
+                if (use_mlock && ggml_backend_buffer_is_host(buf) && !ggml_backend_buffer_is_multi_buffer(buf)) {
                     model.mlock_bufs.emplace_back(new llama_mlock);
                     auto & mlock_buf = model.mlock_bufs.back();
                     mlock_buf->init   (ggml_backend_buffer_get_base(buf));
@@ -5227,7 +5234,7 @@ static bool llm_load_tensors(
     // Split display: deferred bytes get their own line, the rest counts as resident.
     // Resident totals are grouped by backend name since is_host covers CUDA_Host too.
     auto buf_deferred_mib = [&](ggml_backend_buffer_t buf) -> double {
-        if (!ggml_backend_buffer_is_host(buf)) {
+        if (!ggml_backend_buffer_is_host(buf) || ggml_backend_buffer_is_multi_buffer(buf)) {
             return 0.0;
         }
         const auto * base = (const uint8_t *) ggml_backend_buffer_get_base(buf);
@@ -11700,6 +11707,13 @@ struct llama_data_read {
             }
 
             llama_kv_cache_seq_rm(kv_self, dest_seq_id, -1, -1);
+
+            if (cell_count == 0) {
+                // an empty sequence state only clears the destination seq;
+                // the find_slot + cells asserts below index batch.pos[0], which
+                // does not exist for an empty batch
+                return true;
+            }
 
             llama_batch batch = llama_batch_init(cell_count, 0, 1);
             batch.n_tokens = cell_count;
