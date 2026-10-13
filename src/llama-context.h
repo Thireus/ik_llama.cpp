@@ -327,6 +327,9 @@ struct llama_control_vector {
     struct ggml_tensor * apply_to(struct ggml_context * ctx, struct ggml_tensor * cur, int  il) const {
         ggml_tensor * layer_dir = tensor_for(il);
         if (layer_dir != nullptr) {
+            if (layer_dir->type != cur->type && layer_dir->type == GGML_TYPE_F32) {
+                cur = ggml_cast(ctx, cur, GGML_TYPE_F32);
+            }
             cur = ggml_add(ctx, cur, layer_dir);
         }
         return cur;
@@ -638,6 +641,10 @@ struct llama_context {
         comp_plan csa_plan;
         comp_plan hca_plan;
         comp_plan lid_plan;
+        // compressor state ring -> per-token state rows of the current graph (per-step checkpoint capture)
+        std::map<const ggml_tensor *, ggml_tensor *> capture_rows;
+        // compressor state rings the current graph persists into
+        std::set<const ggml_tensor *> persisted_rings;
 
         std::vector<float> csa_mask_data;
         std::vector<float> hca_mask_data;
