@@ -200,6 +200,10 @@ constexpr int ggml_cuda_highest_compiled_arch(const int arch) {
     return ggml_cuda_highest_compiled_arch_impl(arch, 0, __CUDA_ARCH_LIST__);
 }
 #else
+static constexpr bool ggml_cuda_has_arch(const int) {
+    return true;
+}
+
 static int ggml_cuda_highest_compiled_arch(const int arch) {
     return arch;
 }
@@ -811,6 +815,7 @@ struct ggml_cuda_device_info {
         bool    vmm;                // virtual memory support
         size_t  vmm_granularity;    // granularity of virtual memory
         size_t  total_vram;
+        bool    integrated;
     };
 
     cuda_device_info devices[GGML_CUDA_MAX_DEVICES] = {};

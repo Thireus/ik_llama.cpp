@@ -5096,12 +5096,28 @@ static bool llm_load_tensors(
             break;
         }
     }
+#elif defined(GGML_USE_CUDA)
+    for (int i = 0; i < ggml_backend_cuda_get_device_count(); ++i) {
+        if (ggml_backend_cuda_is_integrated(i)) {
+            ml.integrated_bufts.push_back(ggml_backend_cuda_buffer_type(i));
+        }
+    }
+    bool igpu_skip_bulk_prefetch = false;
+    for (auto & it : ctx_map) {
+        if (ggml_get_first_tensor(it.second) != nullptr &&
+            std::find(ml.integrated_bufts.begin(), ml.integrated_bufts.end(), it.first) != ml.integrated_bufts.end()) {
+            igpu_skip_bulk_prefetch = true;
+            break;
+        }
+    }
 #endif
 
     // --dry-run skips MAP_POPULATE/WILLNEED — tensor data is never read.
     ml.init_mappings(!defer_expert_mmap && !defer_ple_mmap && !dry_run
 #if defined(_WIN32)
         && !win_skip_bulk_prefetch
+#elif defined(GGML_USE_CUDA)
+        && !igpu_skip_bulk_prefetch
 #endif
         , use_mlock ? &model.mlock_mmaps : nullptr, ml.use_thp);
 
@@ -10824,6 +10840,15 @@ bool llama_spec_ckpt_save(struct llama_context * ctx, llama_seq_id seq_id) {
         default:
             return false;
     }
+}
+
+bool llama_rewind_ckpt_save(struct llama_context * ctx, llama_seq_id seq_id, int max_tokens) {
+    llama_spec_ckpt_init(ctx, LLAMA_SPEC_CKPT_GPU_FALLBACK, max_tokens);
+    auto success = llama_spec_ckpt_save(ctx, seq_id);
+    if (!success) {
+        llama_spec_ckpt_discard(ctx);
+    }
+    return success;
 }
 
 enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
