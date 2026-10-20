@@ -2053,6 +2053,10 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
             { LLM_TENSOR_FFN_GATE_SHEXP,     "blk.%d.ffn_gate_shexp" },
             { LLM_TENSOR_FFN_DOWN_SHEXP,     "blk.%d.ffn_down_shexp" },
             { LLM_TENSOR_FFN_UP_SHEXP,       "blk.%d.ffn_up_shexp" },
+            { LLM_TENSOR_INDEXER_Q_PROJ,     "blk.%d.indexer.q_proj" },
+            { LLM_TENSOR_INDEXER_K_PROJ,     "blk.%d.indexer.k_proj" },
+            { LLM_TENSOR_INDEXER_Q_NORM,     "blk.%d.indexer.q_norm" },
+            { LLM_TENSOR_INDEXER_K_NORM,     "blk.%d.indexer.k_norm" },
         },
     },
     {
@@ -2518,6 +2522,7 @@ std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ3_KS_R16:return "IQ3_KS_R16 - 3.1875 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ4_KS_R16:return "IQ4_KS_R16 - 4.25 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ5_KS_R4:return "IQ5_KS_R4 - 5.25 bpw";
+        case LLAMA_FTYPE_MOSTLY_IQ5_KS_R16:return "IQ5_KS_R16 - 5.25 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ4_KSS:  return "IQ4_KSS - 4.0 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ5_KS:   return "IQ5_KS - 5.25 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ2_K:    return "IQ2_K - 2.375 bpw";
