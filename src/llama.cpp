@@ -3068,9 +3068,12 @@ static void llm_load_print_meta(llama_model_loader & ml, llama_model & model) {
         LLAMA_LOG_INFO("%s: rope_yarn_log_mul    = %.4f\n",   __func__, hparams.rope_yarn_log_mul);
     }
 
-    if (model.arch == LLM_ARCH_QWEN2MOE) {
+    if (model.arch == LLM_ARCH_QWEN2MOE || model.arch == LLM_ARCH_FLINT) {
+        LLAMA_LOG_INFO("%s: n_layer_dense_lead = %d\n",   __func__, hparams.n_layer_dense_lead);
         LLAMA_LOG_INFO("%s: n_ff_exp         = %d\n",     __func__, hparams.n_ff_exp);
         LLAMA_LOG_INFO("%s: n_ff_shexp       = %d\n",     __func__, hparams.n_ff_shexp);
+        LLAMA_LOG_INFO("%s: expert_weights_norm  = %d\n", __func__, hparams.expert_weights_norm);
+        LLAMA_LOG_INFO("%s: expert_weights_scale = %.1f\n", __func__, hparams.expert_weights_scale);
     }
 
     if (model.arch == LLM_ARCH_QWEN3MOE || model.arch == LLM_ARCH_OPENAI_MOE || model.arch == LLM_ARCH_QWEN3VLMOE) {
@@ -4253,6 +4256,7 @@ static bool is_model_split_supported(const llama_model & model) {
         //LLM_ARCH_QWEN3NEXT,
         LLM_ARCH_QWEN35,
         LLM_ARCH_QWEN35MOE,
+        LLM_ARCH_FLINT,
         LLM_ARCH_GEMMA4,
         LLM_ARCH_GEMMA4_MTP,
         LLM_ARCH_GEMMA4_ASSISTANT,
@@ -7879,7 +7883,8 @@ static int llama_decode_internal(
         // extract logits
         {
             const bool dflash_skip_logits = (llm_arch_is_dflash_family(lctx.model.arch)
-                && !lctx.dflash.draft_tokens.empty());
+                && !lctx.dflash.draft_tokens.empty()
+                && !lctx.dflash.want_dspark_logits);
             if (dflash_skip_logits) {
                 res = nullptr;
             }
@@ -10238,6 +10243,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_QWEN2MOE:
         case LLM_ARCH_QWEN3:
         case LLM_ARCH_QWEN3MOE:
+        case LLM_ARCH_FLINT:
         case LLM_ARCH_MELLUM:
         case LLM_ARCH_MAPLE:
         case LLM_ARCH_QWEN3NEXT:
@@ -13418,6 +13424,13 @@ float * llama_get_logits_ith(struct llama_context * ctx, int32_t i) {
     }
 }
 
+void llama_set_dflash_want_logits(struct llama_context * ctx, bool want) {
+    if (ctx == nullptr) {
+        return;
+    }
+    ctx->dflash.want_dspark_logits = want;
+}
+
 llama_token llama_get_dflash_draft_token_ith(struct llama_context * ctx, int32_t i) {
     llama_synchronize(ctx);
 
@@ -14408,7 +14421,7 @@ void llama_sample_softmax(struct llama_context * ctx, llama_token_data_array * c
 }
 
 void llama_sample_dist(struct llama_context * ctx, llama_token_data_array * candidates) {
-    llama_sample_softmax_impl(ctx ? &ctx->sampling : nullptr, candidates,  /* normalize */ false);
+    llama_sample_softmax_impl(ctx ? &ctx->sampling : nullptr, candidates,  /* normalize */ true);
 
 }
 void llama_sample_top_k(struct llama_context * ctx, llama_token_data_array * candidates, int32_t k, size_t min_keep) {
