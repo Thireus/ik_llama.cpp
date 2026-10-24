@@ -58,6 +58,8 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"suffix",        COMMON_SPECULATIVE_TYPE_SUFFIX}
 };
 
+const llama_ckpt_data spec_ckpt = { LLAMA_CHECKPOINT_SPEC, 0 };
+
 bool common_speculative_needs_checkpoint(const llama_model * model) {
     return model != nullptr &&
         llama_model_has_recurrent(model);
@@ -1417,7 +1419,7 @@ common_speculative * common_speculative_init(
 
     if (!configs.empty() && common_speculative_needs_checkpoint(target_model)) {
         const int ckpt_tokens = std::max(1, params.get_max_stage_n_max() + 1);
-        const int actual_mode = llama_spec_ckpt_init(ctx_tgt, params.spec_ckpt_mode, ckpt_tokens);
+        const int actual_mode = llama_spec_ckpt_init(ctx_tgt, spec_ckpt, params.spec_ckpt_mode, ckpt_tokens);
         if (actual_mode == LLAMA_SPEC_CKPT_NONE) {
             LOG_ERR("%s: failed to prepare speculative checkpoint mode '%s' during speculative init (max_tokens=%d)\n",
                     __func__,
@@ -1430,7 +1432,7 @@ common_speculative * common_speculative_init(
             }
             return nullptr;
         }
-        llama_spec_ckpt_discard(ctx_tgt);
+        llama_spec_ckpt_discard(ctx_tgt, spec_ckpt);
         params.spec_ckpt_mode = actual_mode;
     }
 
@@ -2133,6 +2135,10 @@ bool common_speculative_load_draft_model(
     params.model_dft = loaded_model;
     params.cparams_dft = common_context_params_to_llama(params_dft);
     params.cparams_dft.moe_cache_size = 0;
+    params.cuda_params = params_dft.cuda_params;
+    params.offload_policy = params_dft.offload_policy;
+    params.cparams_dft.cuda_params    = params.cuda_params.empty()    ? nullptr : (void *) params.cuda_params.data();
+    params.cparams_dft.offload_policy = params.offload_policy.empty() ? nullptr : (void *) &params.offload_policy;
     // draft affinity; inherits the target one when not requested
     const std::vector<int32_t> & cpu_affinity_dft = params.cpu_affinity_configured
         ? params.cpu_affinity
@@ -2182,6 +2188,10 @@ bool common_speculative_prepare_mtp_runtime(
         common_speculative_apply_draft_threads(params, params_mtp);
         params.cparams_dft = common_context_params_to_llama(params_mtp);
         params.cparams_dft.moe_cache_size = 0;
+        params.cuda_params = params_mtp.cuda_params;
+        params.offload_policy = params_mtp.offload_policy;
+        params.cparams_dft.cuda_params    = params.cuda_params.empty()    ? nullptr : (void *) params.cuda_params.data();
+        params.cparams_dft.offload_policy = params.offload_policy.empty() ? nullptr : (void *) &params.offload_policy;
         // same draft affinity as the external draft path
         const std::vector<int32_t> & cpu_affinity_dft = params.cpu_affinity_configured
             ? params.cpu_affinity
@@ -2625,15 +2635,15 @@ static bool common_speculative_checkpoint_save(
     ckpt.n_past = n_past;
     ckpt.sampled = sampled;
 
-    const int actual_mode = llama_spec_ckpt_init(ctx, ckpt_mode, max_tokens);
+    const int actual_mode = llama_spec_ckpt_init(ctx, spec_ckpt, ckpt_mode, max_tokens);
     if (actual_mode == LLAMA_SPEC_CKPT_NONE) {
         return false;
     }
     ckpt.mode = actual_mode;
 
-    ckpt.valid = llama_spec_ckpt_save(ctx, seq_id);
+    ckpt.valid = llama_spec_ckpt_save(ctx, spec_ckpt, seq_id);
     if (!ckpt.valid) {
-        llama_spec_ckpt_discard(ctx);
+        llama_spec_ckpt_discard(ctx, spec_ckpt);
         return false;
     }
 
@@ -2658,7 +2668,7 @@ void common_speculative_checkpoint_discard(
         common_speculative_checkpoint & ckpt,
         llama_context * ctx) {
     ckpt.clear();
-    llama_spec_ckpt_discard(ctx);
+    llama_spec_ckpt_discard(ctx, spec_ckpt);
 }
 
 bool common_speculative_checkpoint_restore(
@@ -2679,7 +2689,7 @@ bool common_speculative_checkpoint_restore(
 
     const int step = (int) ids.size() - 1;
     const enum llama_spec_ckpt_restore_result restore_result = llama_spec_ckpt_restore_ex(
-            ctx, seq_id, ckpt.n_past, ckpt.mode == LLAMA_SPEC_CKPT_PER_STEP ? step : 0);
+            ctx, spec_ckpt, seq_id, ckpt.n_past, ckpt.mode == LLAMA_SPEC_CKPT_PER_STEP ? step : 0);
     if (restore_result == LLAMA_SPEC_CKPT_RESTORE_FAILED) {
         LOG_ERR("%s: seq_id=%d speculative checkpoint restore failed\n", __func__, (int) seq_id);
         common_speculative_checkpoint_discard(ckpt, ctx);

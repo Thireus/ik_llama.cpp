@@ -345,6 +345,10 @@ static ggml_tensor * qwen4exp_qsa_mask(
             ggml_set_input(t);
             ggml_build_forward_expand(gf, t);
         }
+        auto causal = ggml_view_2d(ctx0, KQ_mask, n_kv, n_tokens, KQ_mask->nb[1], 0);
+        auto cut_mask = ggml_add(ctx0, causal, inp->bias);
+        cb(cut_mask, "qsa_cut_mask", il);
+        inp->cut_mask = cut_mask;
     }
 
     ggml_tensor * k_all = ggml_view_2d(ctx0, kr_cache, idx_dim, n_kv,
@@ -399,23 +403,13 @@ static ggml_tensor * qwen4exp_qsa_mask(
             bctx.ext_factor, bctx.attn_factor, bctx.beta_fast, bctx.beta_slow);
     cb(q, "qsa_q", il);
 
-    // causality and sequence membership come from KQ_mask rather than being rebuilt on the
-    // host; inp->bias carries only what is specific to the block cut
-    ggml_tensor * causal = ggml_view_2d(ctx0, KQ_mask, n_kv, n_tokens, KQ_mask->nb[1], 0);
-    if (causal->type != GGML_TYPE_F32) {
-        causal = ggml_cast(ctx0, causal, GGML_TYPE_F32);
-    }
-    ggml_tensor * cut_mask = ggml_add(ctx0, inp->bias, causal);
-    cb(cut_mask, "qsa_cut_mask", il);
+    auto cut_mask = inp->cut_mask;
+    GGML_ASSERT(cut_mask);
 
     // top-k selects cells, not blocks: every cell carries its own block's pooled key, so the
     // causal mask can still drop cells inside a selected block. The op scores and sorts
     // internally, so the n_kv by n_tokens score matrix is never materialized.
     if (lctx.cparams.fused_idx_topk) {
-        //ggml_tensor * k_cells = ggml_get_rows_ext(ctx0, pooled, inp->cell_blk, true, false);
-        //k_cells = ggml_reshape_3d(ctx0, k_cells, idx_dim, n_kv, 1);
-        //ggml_tensor * fused = ggml_indexer_topk(ctx0, k_cells, q, inp->head_w, cut_mask,
-        //        GGML_UNARY_OP_RELU, width);
         ggml_tensor * fused = ggml_indexer_topk(ctx0, pooled, q, inp->head_w, cut_mask, inp->cell_blk,
                 GGML_UNARY_OP_RELU, width);
         cb(fused, "qsa_top_k", il);
@@ -458,6 +452,7 @@ static bool qwen4exp_qsa_gather(
         llm_build_context & bctx,
         ggml_context      * ctx0,
         ggml_tensor       * top_k,
+        int32_t             n_pad,
         ggml_tensor       * KQ_mask,
         int                 il,
         const llm_build_cb & cb,
@@ -485,7 +480,6 @@ static bool qwen4exp_qsa_gather(
 
     const int32_t n_cells = kv_self.rows(il);
     const int32_t width   = top_k->ne[0];
-    const int32_t n_pad   = GGML_PAD(width, llama_kv_cache::get_padding(bctx.cparams.flash_attn));
 
     // not worth the extra copy until the cache is a few times the selection width
     if (3*n_pad > bctx.n_kv) {
@@ -646,13 +640,31 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
 
             ggml_tensor * k_sel = nullptr;
             ggml_tensor * v_sel = nullptr;
+            const int32_t n_pad = top_k
+                ? GGML_PAD(top_k->ne[0], llama_kv_cache::get_padding(cparams.flash_attn)) : 0;
             const bool gathered = top_k &&
-                qwen4exp_qsa_gather(*this, ctx0, top_k, KQ_mask, il, cb, &k_sel, &v_sel, &mask);
+                qwen4exp_qsa_gather(*this, ctx0, top_k, n_pad, KQ_mask, il, cb, &k_sel, &v_sel, &mask);
 
+            ggml_tensor * selected = nullptr;
+            if (top_k && !gathered && flash_attn && !kv_self.k_l[il]->extra && !kv_self.v_l[il]->extra && 8*n_pad <= n_kv) {
+                selected = ggml_mask_to_index(ctx0, mask, n_pad);
+                cb(selected, "qsa_mask_idx", il);
+                ggml_build_forward_expand(gf, selected);
+            }
+
+            const int n_nodes = gf->n_nodes;
             cur = build_std_attention(gf, nullptr, cur, inp_pos, nullptr, nullptr,
                     mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il, true, false,
                     /* add_input */ false, /* is_norm */ false, /* is_multi */ true,
                     nullptr, -1, 0.0f, nullptr, gathered ? &k_sel : nullptr, gathered ? &v_sel : nullptr);
+            if (selected) {
+                for (int i = n_nodes; i < gf->n_nodes; ++i) {
+                    ggml_tensor * node = gf->nodes[i];
+                    if (node->op == GGML_OP_FLASH_ATTN_EXT && node->src[3] == mask) {
+                        node->src[5] = selected;
+                    }
+                }
+            }
         }
 
         res_hc = qwen4exp_hc_combine(ctx0, hparams, res_hc, cur, inject, n_embd, il, cb);
