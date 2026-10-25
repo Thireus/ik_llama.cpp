@@ -1407,7 +1407,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
     },
 
     [GGML_TYPE_IQ3_KS_R16] = {
-        .type_name                = "iq3ks_r16",
+        .type_name                = "iq3_ks_r16",
         .blck_size                = QK8_0,
         .type_size                = 13, // (204 B per 16-row x 32-col block)/16 rows, rounded up
         .is_quantized             = true,
@@ -17870,30 +17870,31 @@ static void ggml_compute_forward_rms_norm_f32(
     GGML_ASSERT(eps > 0.0f);
 
     // TODO: optimize
-    for (int64_t i03 = 0; i03 < ne03; i03++) {
-        for (int64_t i02 = 0; i02 < ne02; i02++) {
-            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
-                const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+    const int64_t nr = ne01*ne02*ne03;
+    for (int64_t ir = ith; ir < nr; ir += nth) {
+        const int64_t i03 = ir/(ne02*ne01);
+        const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+        const int64_t i01 = ir - i03*ne02*ne01 - i02*ne01;
 
-                ggml_float sum = 0.0;
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    sum += (ggml_float)(x[i00] * x[i00]);
-                }
+        const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
-                const float mean = sum/ne00;
-
-                float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
-
-                memcpy(y, x, ne00 * sizeof(float));
-                // for (int i00 = 0; i00 < ne00; i00++) {
-                //     y[i00] = x[i00];
-                // }
-
-                const float scale = 1.0f/sqrtf(mean + eps);
-
-                ggml_vec_scale_f32(ne00, y, scale);
-            }
+        ggml_float sum = 0.0;
+        for (int64_t i00 = 0; i00 < ne00; i00++) {
+            sum += (ggml_float)(x[i00] * x[i00]);
         }
+
+        const float mean = sum/ne00;
+
+        float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+
+        memcpy(y, x, ne00 * sizeof(float));
+        // for (int i00 = 0; i00 < ne00; i00++) {
+        //     y[i00] = x[i00];
+        // }
+
+        const float scale = 1.0f/sqrtf(mean + eps);
+
+        ggml_vec_scale_f32(ne00, y, scale);
     }
 }
 
