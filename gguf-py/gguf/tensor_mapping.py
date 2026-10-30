@@ -163,6 +163,7 @@ class TensorNameMap:
             "encoder.layers.{bid}.self_attention.query_key_value",                 # chatglm
             "transformer.layers.{bid}.attn.qkv_proj",                              # openelm
             "layers.{bid}.attention.wqkv",
+            "model.layers.{bid}.self_attn.q_k_v_proj",                             # spark2_5
         ),
 
         # Attention query
@@ -349,6 +350,7 @@ class TensorNameMap:
             "transformer.decoder_layer.{bid}.moe.linear_v",  # Grok (merged)
             "transformer.blocks.{bid}.ffn.experts.mlp.v1",   # dbrx
             "model.layers.{bid}.mlp.experts.up_proj",        # qwen2moe (merged)
+            "model.layers.{bid}.block_sparse_moe.experts.w3", # minimax-m2/m3 (merged)
         ),
 
         MODEL_TENSOR.FFN_GATE_UP_EXP: (
@@ -358,6 +360,7 @@ class TensorNameMap:
         ),
 
         MODEL_TENSOR.FFN_UP_SHEXP: (
+            "model.layers.{bid}.block_sparse_moe.shared_experts.up_proj",
             "model.layers.{bid}.mlp.shared_expert.up_proj",  # qwen2moe
             "model.layers.{bid}.mlp.shared_experts.up_proj", # deepseek2
         ),
@@ -386,9 +389,11 @@ class TensorNameMap:
             "transformer.decoder_layer.{bid}.moe.linear",   # Grok (merged)
             "transformer.blocks.{bid}.ffn.experts.mlp.w1",  # dbrx
             "model.layers.{bid}.mlp.experts.gate_proj",     # qwen2moe (merged)
+            "model.layers.{bid}.block_sparse_moe.experts.w1", # minimax-m2/m3 (merged)
         ),
 
         MODEL_TENSOR.FFN_GATE_SHEXP: (
+            "model.layers.{bid}.block_sparse_moe.shared_experts.gate_proj",
             "model.layers.{bid}.mlp.shared_expert.gate_proj",  # qwen2moe
             "model.layers.{bid}.mlp.shared_experts.gate_proj", # deepseek2
         ),
@@ -426,9 +431,11 @@ class TensorNameMap:
             "transformer.blocks.{bid}.ffn.experts.mlp.w2",   # dbrx
             "model.layers.{bid}.mlp.experts.down_proj",      # qwen2moe (merged)
             "model.layers.{bid}.feed_forward.experts.down_proj",  # lfm2moe (fused experts)
+            "model.layers.{bid}.block_sparse_moe.experts.w2", # minimax-m2/m3 (merged)
         ),
 
         MODEL_TENSOR.FFN_DOWN_SHEXP: (
+            "model.layers.{bid}.block_sparse_moe.shared_experts.down_proj",
             "model.layers.{bid}.mlp.shared_expert.down_proj",  # qwen2moe
             "model.layers.{bid}.mlp.shared_experts.down_proj", # deepseek2
         ),
@@ -536,6 +543,40 @@ class TensorNameMap:
             "backbone.layers.{bid}.mixer.conv1d",
         ),
 
+        # Raon-1 / Kimi Linear short convolutions and RDA projections
+        MODEL_TENSOR.SSM_CONV1D_Q: (
+            "model.layers.{bid}.self_attn.q_conv1d",
+            "model.layers.{bid}.attention.q_conv1d",
+        ),
+        MODEL_TENSOR.SSM_CONV1D_K: (
+            "model.layers.{bid}.self_attn.k_conv1d",
+            "model.layers.{bid}.attention.k_conv1d",
+        ),
+        MODEL_TENSOR.SSM_CONV1D_V: (
+            "model.layers.{bid}.self_attn.v_conv1d",
+            "model.layers.{bid}.attention.v_conv1d",
+        ),
+        MODEL_TENSOR.SSM_F_A: (
+            "model.layers.{bid}.self_attn.f_a_proj",
+            "model.layers.{bid}.attention.f_a_proj",
+        ),
+        MODEL_TENSOR.SSM_F_B: (
+            "model.layers.{bid}.self_attn.f_b_proj",
+            "model.layers.{bid}.attention.f_b_proj",
+        ),
+        MODEL_TENSOR.SSM_BETA: (
+            "model.layers.{bid}.self_attn.b_proj",
+            "model.layers.{bid}.attention.b_proj",
+        ),
+        MODEL_TENSOR.SSM_RDA: (
+            "model.layers.{bid}.self_attn.rda_w_proj",
+            "model.layers.{bid}.attention.rda_w_proj",
+        ),
+        MODEL_TENSOR.SSM_NORM: (
+            "model.layers.{bid}.self_attn.o_norm",
+            "model.layers.{bid}.attention.o_norm",
+        ),
+
         MODEL_TENSOR.SSM_X: (
             "model.layers.{bid}.x_proj",
             "backbone.layers.{bid}.mixer.x_proj",
@@ -544,11 +585,15 @@ class TensorNameMap:
         MODEL_TENSOR.SSM_DT: (
             "model.layers.{bid}.dt_proj",
             "backbone.layers.{bid}.mixer.dt_proj",
+            "model.layers.{bid}.self_attn.dt_proj",
+            "model.layers.{bid}.attention.dt_proj",
         ),
 
         MODEL_TENSOR.SSM_A: (
             "model.layers.{bid}.A_log",
             "backbone.layers.{bid}.mixer.A_log",
+            "model.layers.{bid}.self_attn.A_log",
+            "model.layers.{bid}.attention.A_log",
         ),
 
         MODEL_TENSOR.SSM_D: (
@@ -758,6 +803,22 @@ class TensorNameMap:
 
         MODEL_TENSOR.INDEXER_ATTN_Q_B: (
             "model.layers.{bid}.indexer.attn_q_b",
+        ),
+
+        MODEL_TENSOR.INDEXER_Q_PROJ: (
+            "model.layers.{bid}.self_attn.index_q_proj", # minimax-m3
+        ),
+
+        MODEL_TENSOR.INDEXER_Q_NORM: (
+            "model.layers.{bid}.self_attn.index_q_norm", # minimax-m3
+        ),
+
+        MODEL_TENSOR.INDEXER_K_PROJ: (
+            "model.layers.{bid}.self_attn.index_k_proj", # minimax-m3
+        ),
+
+        MODEL_TENSOR.INDEX_K_NORM: (
+            "model.layers.{bid}.self_attn.index_k_norm", # minimax-m3
         ),
     }
 

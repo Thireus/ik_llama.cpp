@@ -1,4 +1,5 @@
 #include "llama-spec-features.h"
+#include "llama-spec-features-dflash.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -7,6 +8,18 @@
 
 #include "llama-model.h"
 #include "llama-context.h"
+
+ggml_tensor * llama_dflash_hc_mean_for_capture(ggml_context * ctx, ggml_tensor * tensor, int32_t hc_count) {
+    GGML_ASSERT(ctx != nullptr && tensor != nullptr);
+    GGML_ASSERT(hc_count > 0 && tensor->ne[1] == hc_count && tensor->ne[2] > 0);
+
+    ggml_tensor * mean = ggml_view_2d(ctx, tensor, tensor->ne[0], tensor->ne[2], tensor->nb[2], 0);
+    for (int32_t hc = 1; hc < hc_count; ++hc) {
+        mean = ggml_add(ctx, mean,
+                ggml_view_2d(ctx, tensor, tensor->ne[0], tensor->ne[2], tensor->nb[2], hc * tensor->nb[1]));
+    }
+    return ggml_scale(ctx, mean, 1.0f / (float) hc_count);
+}
 
 void llama_reset_dflash_kv_cache_state(struct llama_context * ctx) {
     if (ctx == nullptr) {
@@ -98,6 +111,13 @@ int32_t llama_model_dflash_n_target_layers(const struct llama_model * model) {
 
 int32_t llama_model_dflash_n_target_features(const struct llama_model * model) {
     return model ? (int32_t) model->hparams.dflash_n_target_features : 0;
+}
+
+int32_t llama_model_dflash_target_streams(const struct llama_model * model) {
+    if (!model || model->hparams.dsv4_hc_mult <= 1) {
+        return 1;
+    }
+    return (int32_t) model->hparams.dsv4_hc_mult;
 }
 
 int32_t llama_model_dflash_target_layer_ids(
@@ -662,7 +682,7 @@ void llama_clear_dflash_capture(struct llama_context * ctx) {
     }
 }
 
-void llama_begin_dflash_capture_batch(struct llama_context * ctx, int32_t expected_rows) {
+void llama_begin_dflash_capture_batch(struct llama_context * ctx, int32_t expected_rows, bool new_batch) {
     if (ctx == nullptr || !ctx->dflash.capture) {
         return;
     }
@@ -672,7 +692,9 @@ void llama_begin_dflash_capture_batch(struct llama_context * ctx, int32_t expect
         llama_synchronize(ctx);
         capture.readback_pending = false;
     }
-    capture.capture_batch_id++;
+    if (new_batch) {
+        capture.capture_batch_id++;
+    }
     capture.row_count = 0;
     capture.row_width = 0;
     capture.expected_rows = expected_rows;

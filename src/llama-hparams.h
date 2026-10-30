@@ -40,6 +40,9 @@ struct llama_hparams {
     bool     swa_full_non_causal = false; // DSV4 vision: in a non-causal (image) span, window only clips older tokens
     uint32_t n_embd_head_k_full; // dimension of keys (d_k). d_q is assumed to be the same, but there are n_head q heads, and only n_head_kv k-v heads
     uint32_t n_embd_head_v_full; // dimension of values (d_v) aka n_embd_head
+    uint32_t n_embd_head_k_mla_impl = 0; // per-head MLA key width (Raon-1: 192)
+    uint32_t n_embd_head_v_mla_impl = 0; // per-head MLA value width (Raon-1: 128)
+    float    f_norm_rms_eps_latent = 0.0f;
     uint32_t n_embd_head_k_swa;
     uint32_t n_embd_head_v_swa;
     uint32_t n_expert = 0;
@@ -107,6 +110,7 @@ struct llama_hparams {
     uint32_t ssm_d_inner = 0;
     uint32_t ssm_d_state = 0;
     uint32_t ssm_dt_rank = 0;
+    uint32_t ssm_dt_rank_f = 0; // low-rank gate projection width (Raon-1: 128, while n_v_heads = 40)
     uint32_t ssm_n_group = 0;
     bool     kda_safe_gate = false;
     float    kda_gate_lower_bound = 0.0f;
@@ -166,6 +170,9 @@ struct llama_hparams {
     uint32_t dsv4_hash_layer_count  = 0;
     float    dsv4_compress_rope_base = 0.0f;
     float    dsv4_hc_eps             = 0.0f;
+    float    hc_magnitude            = 0.0f;
+    float    situ_beta               = 4.0f;
+    float    situ_linear_beta        = 25.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios = {};
 
     // The two compressed-stream plan slots. V4 hardcodes 4 (overlapping groups) and 128;
@@ -191,12 +198,15 @@ struct llama_hparams {
     std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_index_key_source = {};
     std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_topk_source      = {};
 
+    int32_t dsv41_replay_boundary = -1;   // first decoder layer: first KV source whose ratio differs from the previous one, -1 if none
+
     int32_t  dsv4_candidate_source_layer = -1;
     uint32_t dsv4_candidate_block_size   = 0;
     uint32_t dsv4_candidate_topk_blocks  = 0;
     bool dsv41_is_kv_source   (uint32_t il) const { return dsv4_shared_streams && dsv41_kv_source[il]        == (int32_t) il; }
     bool dsv41_owns_index_k   (uint32_t il) const { return dsv4_shared_streams && dsv41_index_key_source[il] == (int32_t) il; }
     bool dsv41_is_index_source(uint32_t il) const { return dsv4_shared_streams && dsv41_topk_source[il]      == (int32_t) il; }
+    bool dsv41_has_replay_segment() const { return dsv41_replay_boundary > 0 && dsv41_replay_boundary < (int32_t) n_layer; }
 
     // DeepSeek-V4.1 engram: n-gram keyed tables added into the stream at a few layers
     uint32_t engram_n_head         = 0;
@@ -297,6 +307,9 @@ struct llama_hparams {
         if (this->n_swa_pattern != other.n_swa_pattern) return false;
         if (this->n_embd_head_k_full != other.n_embd_head_k_full) return true;
         if (this->n_embd_head_v_full != other.n_embd_head_v_full) return true;
+        if (this->n_embd_head_k_mla_impl != other.n_embd_head_k_mla_impl) return true;
+        if (this->n_embd_head_v_mla_impl != other.n_embd_head_v_mla_impl) return true;
+        if (!is_float_close(this->f_norm_rms_eps_latent, other.f_norm_rms_eps_latent, 1e-9f)) return true;
         if (this->n_expert      != other.n_expert)      return true;
         if (this->n_expert_used != other.n_expert_used) return true;
 
@@ -338,6 +351,9 @@ struct llama_hparams {
         if (!is_float_close(this->f_norm_eps,            other.f_norm_eps,            EPSILON)) return true;
         if (!is_float_close(this->f_norm_rms_eps,        other.f_norm_rms_eps,        EPSILON)) return true;
         if (!is_float_close(this->kda_gate_lower_bound,  other.kda_gate_lower_bound,  EPSILON)) return true;
+        if (!is_float_close(this->hc_magnitude,          other.hc_magnitude,          EPSILON)) return true;
+        if (!is_float_close(this->situ_beta,             other.situ_beta,             EPSILON)) return true;
+        if (!is_float_close(this->situ_linear_beta,      other.situ_linear_beta,      EPSILON)) return true;
         if (!is_float_close(this->rope_attn_factor,      other.rope_attn_factor,      EPSILON)) return true;
         if (!is_float_close(this->rope_freq_base_train,  other.rope_freq_base_train,  EPSILON)) return true;
         if (!is_float_close(this->rope_freq_scale_train, other.rope_freq_scale_train, EPSILON)) return true;
@@ -409,6 +425,10 @@ struct llama_hparams {
     uint32_t n_embd_head_k(int il) const { return swa_layers[il] ? n_embd_head_k_swa : n_embd_head_k_full; }
 
     uint32_t n_embd_head_v(int il) const { return swa_layers[il] ? n_embd_head_v_swa : n_embd_head_v_full; }
+
+    uint32_t n_embd_head_k_mla(int = 0) const { return n_embd_head_k_mla_impl; }
+
+    uint32_t n_embd_head_v_mla(int = 0) const { return n_embd_head_v_mla_impl; }
 
     uint32_t n_embd_k_gqa(uint32_t il = 0) const { // dimension of key embeddings across all k-v heads
         return n_head_kv(il) * n_embd_head_k(il);

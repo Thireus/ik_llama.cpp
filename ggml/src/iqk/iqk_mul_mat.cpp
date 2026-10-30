@@ -125,6 +125,8 @@ struct MulMat {
     inline static void gelu(int n, const float * src, float * dst);
     inline static void relu(int n, const float * src, float * dst);
     inline static void silu(int n, const float * src, float * dst);
+    inline static void situ(int n, const float * src, float * dst, float beta);
+    inline static void situ_up(int n, const float * src, float * dst, float beta);
     inline static void swiglu_oai(int n, const float * src, float * dst);
     inline static void clamp_oai(int n, float *x);
     inline static void activate(ggml_unary_op op, int n, const float * src, float * dst) {
@@ -136,7 +138,8 @@ struct MulMat {
     }
     inline void mul_mat_up_gate_NxM(int n, const void * vx_up, const void * vx_gate, size_t bx,
             const float * up_b, const float * gate_b,
-            DataInfo& info, int nrc_x, int nrc_y, int unary_op, float limit) {
+            DataInfo& info, int nrc_x, int nrc_y, int unary_op, float limit,
+            float situ_beta, float situ_beta_linear) {
 #ifdef __aarch64__
         constexpr int k_x_step = 64; //8192; // Tiling does not seem to help on my M2 Max (but difference to tiling is small)
 #else
@@ -144,7 +147,7 @@ struct MulMat {
 #endif
         auto op = ggml_unary_op(unary_op);
         float tmp[k_x_step*16];
-        auto process = [&tmp, n, op, vx_gate, vx_up, gate_b, up_b, bx, xstep = k_x_step, limit] (mul_mat_t func, const DataInfo& this_info, int ix, int this_nrc_x, int ny) {
+        auto process = [&tmp, n, op, vx_gate, vx_up, gate_b, up_b, bx, xstep = k_x_step, limit, situ_beta, situ_beta_linear] (mul_mat_t func, const DataInfo& this_info, int ix, int this_nrc_x, int ny) {
             func(n, (const void *)((const char *)vx_gate + ix*bx), bx, this_info, this_nrc_x);
             for (int ky = 0; ky < ny; ++ky) {
                 if (gate_b) {
@@ -152,8 +155,12 @@ struct MulMat {
                     auto x = this_info.dst_row(ky);
                     for (int j = 0; j < this_nrc_x; ++j) x[j] += b[j];
                 }
-                activate(op, this_nrc_x, this_info.dst_row(ky), tmp + ky*xstep);
-                if (limit > 1e-6f) {
+                if (op == GGML_UNARY_OP_SITU_GLU) {
+                    situ(this_nrc_x, this_info.dst_row(ky), tmp + ky*xstep, situ_beta);
+                } else {
+                    activate(op, this_nrc_x, this_info.dst_row(ky), tmp + ky*xstep);
+                }
+                if (op != GGML_UNARY_OP_SITU_GLU && limit > 1e-6f) {
                     for (int j = 0; j < this_nrc_x; ++j) tmp[ky*xstep + j] = std::min(tmp[ky*xstep + j], limit);
                 }
             }
@@ -164,7 +171,11 @@ struct MulMat {
                     auto b = up_b + ix;
                     for (int j = 0; j < this_nrc_x; ++j) result[j] += b[j];
                 }
-                if (op == GGML_UNARY_OP_SWIGLU_OAI) {
+                if (op == GGML_UNARY_OP_SITU_GLU) {
+                    if (situ_beta_linear > 0.0f) {
+                        situ_up(this_nrc_x, result, result, situ_beta_linear);
+                    }
+                } else if (op == GGML_UNARY_OP_SWIGLU_OAI) {
                     clamp_oai(this_nrc_x, result);
                 } else if (limit > 1e-6f) {
                     for (int j = 0; j < this_nrc_x; ++j) result[j] = std::max(-limit, std::min(limit, result[j]));
@@ -305,7 +316,12 @@ struct MulMat {
             case GGML_TYPE_Q6_0   : return nrc_y >= 32 ? GGML_TYPE_Q8_0_R8 : type;
             case GGML_TYPE_IQ4_NL : return nrc_y >= 32 ? GGML_TYPE_Q8_0_R8 : type;
             case GGML_TYPE_MXFP4  : return nrc_y >= 32 ? GGML_TYPE_Q8_0_R8 : type;
+#ifdef HAVE_FANCY_SIMD
+            case GGML_TYPE_Q8_0   : return nrc_y >= 32 ? GGML_TYPE_Q8_0_R16 : type;
+            case GGML_TYPE_Q8_0_R8: return nrc_y >= 32 ? GGML_TYPE_Q8_0_R16 : type;
+#else
             case GGML_TYPE_Q8_0   : return nrc_y >= 32 ? GGML_TYPE_Q8_0_R8 : type;
+#endif
 #ifdef HAVE_FANCY_SIMD
             case GGML_TYPE_IQ1_KT : return nrc_y >= 16 ? q8_k_type : type;
             case GGML_TYPE_IQ2_KT : return nrc_y >= 16 ? q8_k_type : type;
@@ -397,6 +413,7 @@ struct MulMat {
             case GGML_TYPE_Q4_0_R8:
             case GGML_TYPE_Q8_0_R8:
             case GGML_TYPE_Q8_1:
+            case GGML_TYPE_Q8_0_R16:
             case GGML_TYPE_Q8_K_R16:
             case GGML_TYPE_MXFP4_R8:
             case GGML_TYPE_IQ4_KS_R16:
@@ -540,7 +557,7 @@ bool iqk_convert_repack(int typeA, int n, const void * vx, size_t bx, void * vy,
         case GGML_TYPE_MXFP4_R8:
         case GGML_TYPE_Q5_0_R4:
         case GGML_TYPE_Q6_0_R4:
-        //case GGML_TYPE_Q8_0_R8:
+        case GGML_TYPE_Q8_0_R8:
         case GGML_TYPE_IQ4_NL_R4:
         case GGML_TYPE_IQ4_KS_R16:
         case GGML_TYPE_IQ5_KS_R16:
@@ -580,6 +597,36 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
     size_t row_size_qy = strideB; //*ggml_type_size(ggml_type(typeB));
 
     if (Nx/nth < k_min_step) {
+        if (auto dequant_type = MulMat::is_dequant_better(ggml_type(typeA), Ny); Ny >= 64 && dequant_type != ggml_type(typeA) &&
+                Nx%MulMat::num_rows(dequant_type) == 0 && MulMat::prepare(dequant_type, typeB, ne00, mm, Ny)) {
+            constexpr int k_y_step = 64;
+            const int x_step  = std::max(16, MulMat::num_rows(dequant_type));
+            const int ntile_x = (Nx + x_step - 1)/x_step;
+            const int ntile_y = (Ny + k_y_step - 1)/k_y_step;
+            const int ntile   = ntile_x*ntile_y;
+            const int npt     = (ntile + nth - 1)/nth;
+            const int first   = ith*npt;
+            const int last    = std::min(ntile, first + npt);
+            size_t row_size_dq = ggml_row_size(dequant_type, ne00);
+            auto& f = thread_local_work_buffer();
+            int converted_ix = -1;
+            for (int itile = first; itile < last; ++itile) {
+                int ix = (itile / ntile_y) * x_step;
+                int iy = (itile % ntile_y) * k_y_step;
+                int nrc_x = std::min<int>(x_step, Nx - ix);
+                int nrc_y = std::min<int>(k_y_step, Ny - iy);
+                if (ix != converted_ix) {
+                    if (f.size() < row_size_dq*nrc_x) f.resize(row_size_dq*nrc_x);
+                    if (!iqk_convert_repack(typeA, ne00, (const char *)A + ix*strideA, strideA, f.data(), ne00, nrc_x)) {
+                        GGML_ABORT("Fatal error");
+                    }
+                    converted_ix = ix;
+                }
+                DataInfo info{C + ix, (const char *)B, (size_t)stride_C, row_size_qy, iy, 1, nullptr, 0};
+                mm.mul_mat_NxM(ne00, f.data(), row_size_dq, info, nrc_x, iy + nrc_y);
+            }
+            return true;
+        }
         if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {
             return false;
         }
@@ -849,7 +896,8 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
         int typeA, const void * Aup, const void * Agate, long strideA,
         int typeB, const void * B, long strideB,
         const char * up_b_c, const char * gate_b_c,
-        float * C, long nb1, long nb2, const void * vrow_mapping, float limit, int ith, int nth) {
+        float * C, long nb1, long nb2, const void * vrow_mapping, float limit,
+        float situ_beta, float situ_beta_linear, int ith, int nth) {
 
     const mmid_row_mapping * row_mapping = (const mmid_row_mapping *)vrow_mapping;
     //assert(row_mapping != nullptr);
@@ -894,7 +942,7 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
                 }
                 auto up_b   = up_b_c   ? (const float *)up_b_c + first_x + ix : nullptr;
                 auto gate_b = gate_b_c ? (const float *)gate_b_c + first_x + ix : nullptr;
-                mm.mul_mat_up_gate_NxM(ne00, Xu, Xg, row_size_qx, up_b, gate_b, this_info, this_nrc_x, Ny, unary_op, limit);
+                mm.mul_mat_up_gate_NxM(ne00, Xu, Xg, row_size_qx, up_b, gate_b, this_info, this_nrc_x, Ny, unary_op, limit, situ_beta, situ_beta_linear);
             }
 
             return true;
@@ -917,7 +965,7 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
     auto up_b   = up_b_c   ? (const float *)up_b_c + first_x : nullptr;
     auto gate_b = gate_b_c ? (const float *)gate_b_c + first_x : nullptr;
     mm.mul_mat_up_gate_NxM(ne00, (const char *)Aup + row_size_qx*first_x, (const char *)Agate + row_size_qx*first_x, row_size_qx,
-            up_b, gate_b, info, nrc_x, Ny, unary_op, limit);
+            up_b, gate_b, info, nrc_x, Ny, unary_op, limit, situ_beta, situ_beta_linear);
     return true;
 }
 
@@ -999,6 +1047,7 @@ bool MulMat::prepare(int typeA, int typeB, int ne00, MulMat& mm, int Ny) {
         case GGML_TYPE_Q4_0_R8:
         case GGML_TYPE_Q5_0_R4:
         case GGML_TYPE_Q6_0_R4:
+        case GGML_TYPE_Q8_0_R16:
         case GGML_TYPE_Q8_0_R8:
         case GGML_TYPE_IQ4_NL_R4:
         case GGML_TYPE_MXFP4:
@@ -1191,6 +1240,22 @@ void MulMat::silu(int n, const float * x, float * y) {
     for (; i + 3 < n; i += 4) vst1q_f32(y + i, v_silu(vld1q_f32(x + i)));
     for (; i < n; ++i) y[i] = x[i]/(1.0f + expf(-x[i]));
 }
+void MulMat::situ(int n, const float * x, float * y, float beta) {
+    int i = 0;
+    const float inv_beta = 1.0f/beta;
+    for (; i + 3 < n; i += 4) vst1q_f32(y + i, v_situ(vld1q_f32(x + i), beta));
+    for (; i < n; ++i) y[i] = beta*tanhf(x[i]*inv_beta)/(1.0f + expf(-x[i]));
+}
+void MulMat::situ_up(int n, const float * x, float * y, float beta) {
+    if (beta <= 0.0f) {
+        if (x != y) memcpy(y, x, n*sizeof(float));
+        return;
+    }
+    int i = 0;
+    const float inv_beta = 1.0f/beta;
+    for (; i + 3 < n; i += 4) vst1q_f32(y + i, v_situ_up(vld1q_f32(x + i), beta));
+    for (; i < n; ++i) y[i] = beta*tanhf(x[i]*inv_beta);
+}
 void MulMat::relu(int n, const float * x, float * y) {
     for (int j = 0; j < n; ++j) y[j] = x[j] > 0 ? x[j] : 0;
 }
@@ -1261,6 +1326,32 @@ void MulMat::silu(int n, const float * x, float * y) {
     for (; i + 7 < n; i += 8) _mm256_storeu_ps(y + i, v_silu(_mm256_loadu_ps(x + i)));
 #endif
     for (; i < n; ++i) y[i] = x[i]/(1.0f + expf(-x[i]));
+}
+void MulMat::situ(int n, const float * x, float * y, float beta) {
+    int i = 0;
+    const float inv_beta = 1.0f/beta;
+#if defined __AVX512F__ && defined __AVX512DQ__
+    for (; i + 15 < n; i += 16) _mm512_storeu_ps(y + i, v_situ(_mm512_loadu_ps(x + i), beta));
+#endif
+#if defined __AVX2__ && defined __FMA__
+    for (; i + 7 < n; i += 8) _mm256_storeu_ps(y + i, v_situ(_mm256_loadu_ps(x + i), beta));
+#endif
+    for (; i < n; ++i) y[i] = beta*tanhf(x[i]*inv_beta)/(1.0f + expf(-x[i]));
+}
+void MulMat::situ_up(int n, const float * x, float * y, float beta) {
+    if (beta <= 0.0f) {
+        if (x != y) memcpy(y, x, n*sizeof(float));
+        return;
+    }
+    int i = 0;
+    const float inv_beta = 1.0f/beta;
+#if defined __AVX512F__ && defined __AVX512DQ__
+    for (; i + 15 < n; i += 16) _mm512_storeu_ps(y + i, v_situ_up(_mm512_loadu_ps(x + i), beta));
+#endif
+#if defined __AVX2__ && defined __FMA__
+    for (; i + 7 < n; i += 8) _mm256_storeu_ps(y + i, v_situ_up(_mm256_loadu_ps(x + i), beta));
+#endif
+    for (; i < n; ++i) y[i] = beta*tanhf(x[i]*inv_beta);
 }
 
 void MulMat::relu(int n, const float * x, float * y) {
@@ -1821,11 +1912,17 @@ bool iqk_fused_delta_net(int head_dim, int n_heads, int gqa_ratio, int repeat_ty
 namespace {
 constexpr int k_indexer_chunks = 64;
 constexpr int k_n_bucket = 64;
+// an I32 mask holds the visible count of each row
+int iqk_indexer_n_kv(const struct ggml_tensor * dst) {
+    auto m = dst->src[3];
+    auto c = dst->src[4];
+    return m->type != GGML_TYPE_I32 ? m->ne[0] : c ? c->ne[0] : dst->src[0]->ne[1];
+}
 size_t iqk_idx_topk_work_wbs_per_thread(const struct ggml_tensor * dst, int nth) {
     auto k = dst->src[0];
     auto q = dst->src[1];
-    auto m = dst->src[3];
     auto c = dst->src[4];
+    auto n_kv = iqk_indexer_n_kv(dst);
     if (q->ne[2] >= nth) {
         size_t size = 0;
         auto tt = ggml_internal_get_type_traits(k->type);
@@ -1839,8 +1936,8 @@ size_t iqk_idx_topk_work_wbs_per_thread(const struct ggml_tensor * dst, int nth)
         }
 #endif
         size += k_indexer_chunks * q->ne[1] * sizeof(float);
-        size += m->ne[0] * sizeof(float);
-        size += m->ne[0] * sizeof(int32_t);
+        size += n_kv * sizeof(float);
+        size += n_kv * sizeof(int32_t);
         if (c) size += k->ne[1] * sizeof(float);
 #ifdef __AVX2__
         if (k->type == GGML_TYPE_F16 && q->type == GGML_TYPE_F32 && k->ne[1] % 32 == 0 && q->ne[1] % 8 == 0) {
@@ -1860,6 +1957,17 @@ size_t iqk_idx_topk_work_wbs_per_thread(const struct ggml_tensor * dst, int nth)
 inline void iqk_f16_to_f32(int n, const ggml_fp16_t * x, float * y) {
     for (int i = 0; i < n; ++i) {
         y[i] = GGML_FP16_TO_FP32(x[i]);
+    }
+}
+void iqk_indexer_mask_row(const struct ggml_tensor * m, int iq, int first, int n, float * y) {
+    auto row = (const char *)m->data + iq*m->nb[1];
+    if (m->type == GGML_TYPE_F32) {
+        std::memcpy(y, (const float *)row + first, n*sizeof(float));
+    } else if (m->type == GGML_TYPE_F16) {
+        iqk_f16_to_f32(n, (const ggml_fp16_t *)row + first, y);
+    } else {
+        auto n_visible = *(const int32_t *)row;
+        for (int j = 0; j < n; ++j) y[j] = first + j < n_visible ? 0.0f : -INFINITY;
     }
 }
 
@@ -2047,7 +2155,6 @@ template <int nrc_y> inline void iqk_mul_f32_f32_r(int n_per_row, int n_rows, si
 size_t iqk_idx_topk_work_buffer_size(const struct ggml_tensor * dst, int nthread) {
     auto k = dst->src[0];
     auto q = dst->src[1];
-    auto m = dst->src[3];
     if (q->ne[2] >= nthread) {
         size_t common_size = 0;
         auto requant_type = MulMat::is_dequant_better(k->type, q->ne[1]);
@@ -2070,10 +2177,11 @@ size_t iqk_idx_topk_work_buffer_size(const struct ggml_tensor * dst, int nthread
         size = ggml_row_size(GGML_TYPE_F16, q->ne[0]) * q->ne[1] * q->ne[2];
     }
 #endif
-    size += m->ne[0] * q->ne[1] * sizeof(float);
-    size += m->ne[0] * sizeof(float);
-    size += m->ne[0] * sizeof(int32_t);
-    size += (2*m->ne[0] + k_n_bucket)*sizeof(int);
+    auto n_kv = iqk_indexer_n_kv(dst);
+    size += n_kv * q->ne[1] * sizeof(float);
+    size += n_kv * sizeof(float);
+    size += n_kv * sizeof(int32_t);
+    size += (size_t(2)*n_kv + k_n_bucket)*sizeof(int);
     return size;
 }
 
@@ -2092,13 +2200,13 @@ bool iqk_indexer_topk(struct ggml_tensor * dst, void * work_buffer, barrier_t ba
     auto m = dst->src[3];
     auto c = dst->src[4];
     if (k->ne[2] != 1 || k->ne[3] != 1) return false;
-    int n_kv = m->ne[0];
+    int n_kv = iqk_indexer_n_kv(dst);
     if (c) {
         GGML_ASSERT(c->type == GGML_TYPE_I32);
         GGML_ASSERT(ggml_nrows(c) == 1);
-        GGML_ASSERT(c->ne[0] == m->ne[0]);
+        GGML_ASSERT(c->ne[0] == n_kv);
     } else {
-        if (k->ne[1] != m->ne[0]) return false;
+        if (k->ne[1] != n_kv) return false;
     }
     if (n_kv <= n_top_k) return false;
     if (k->ne[0] != q->ne[0]) return false;
@@ -2106,7 +2214,7 @@ bool iqk_indexer_topk(struct ggml_tensor * dst, void * work_buffer, barrier_t ba
     if (q->ne[1] != w->ne[0]) return false;
     if (q->ne[2] != w->ne[1]) return false;
     if (q->type != GGML_TYPE_F32) return false;
-    if (m->type != GGML_TYPE_F32 && m->type != GGML_TYPE_F16) return false;
+    if (m->type != GGML_TYPE_F32 && m->type != GGML_TYPE_F16 && m->type != GGML_TYPE_I32) return false;
 
     auto work_size = iqk_idx_topk_work_wbs_per_thread(dst, nth);
     auto work_all = (char *)work_buffer;
@@ -2189,7 +2297,6 @@ bool iqk_indexer_topk(struct ggml_tensor * dst, void * work_buffer, barrier_t ba
         //auto counts  = idx_aux + k->ne[1];
         for (int iq = ith; iq < q->ne[2]; iq += nth) {
             auto this_q = (const char *)q->data + iq*q->nb[2];
-            auto this_m = (const char *)m->data + iq*m->nb[1];
             auto this_w = (const float *)((const char *)w->data + w->nb[1]*iq);
             bool done = false;
 #ifdef __AVX2__
@@ -2205,14 +2312,15 @@ bool iqk_indexer_topk(struct ggml_tensor * dst, void * work_buffer, barrier_t ba
                     __m256 acc[4];
                     if (c) {
                         for (int i = 0; i < 4; ++i) acc[i] = _mm256_setzero_ps();
+                    } else if (m->type == GGML_TYPE_I32) {
+                        iqk_indexer_mask_row(m, iq, ik, 32, score + ik);
+                        for (int k = 0; k < 4; ++k) acc[k] = _mm256_loadu_ps(score + ik + 8*k);
+                    } else if (m->type == GGML_TYPE_F32) {
+                        auto m32 = (const float *)((const char *)m->data + iq*m->nb[1]) + ik;
+                        for (int k = 0; k < 4; ++k) acc[k] = _mm256_loadu_ps(m32 + 8*k);
                     } else {
-                        if (m->type == GGML_TYPE_F32) {
-                            auto m32 = (const float *)this_m + ik;
-                            for (int k = 0; k < 4; ++k) acc[k] = _mm256_loadu_ps(m32 + 8*k);
-                        } else {
-                            auto m16 = (const ggml_fp16_t *)this_m + ik;
-                            for (int k = 0; k < 4; ++k) acc[k] = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)m16 + k));
-                        }
+                        auto m16 = (const ggml_fp16_t *)((const char *)m->data + iq*m->nb[1]) + ik;
+                        for (int k = 0; k < 4; ++k) acc[k] = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)m16 + k));
                     }
                     auto kq_i = kq_local;
                     for (int i = 0; i < int(q->ne[1]); ++i) {
@@ -2243,11 +2351,7 @@ bool iqk_indexer_topk(struct ggml_tensor * dst, void * work_buffer, barrier_t ba
                 auto this_score = score + i_step*k_indexer_chunks;
 
                 if (!c) {
-                    if (m->type == GGML_TYPE_F32) {
-                        std::memcpy(this_score, (const float *)this_m + i_step*k_indexer_chunks, nk*sizeof(float));
-                    } else {
-                        iqk_f16_to_f32(nk, (const ggml_fp16_t *)this_m + i_step*k_indexer_chunks, this_score);
-                    }
+                    iqk_indexer_mask_row(m, iq, i_step*k_indexer_chunks, nk, this_score);
                 } else {
                     for (int i = 0; i < nk; ++i) this_score[i] = 0;
                 }
@@ -2286,11 +2390,7 @@ bool iqk_indexer_topk(struct ggml_tensor * dst, void * work_buffer, barrier_t ba
 
             for (int j = 0; j < n_kv; ++j) sorted[j] = j;
             if (c) {
-                if (m->type == GGML_TYPE_F32) {
-                    std::memcpy(score_c, this_m, n_kv*sizeof(float));
-                } else {
-                    iqk_f16_to_f32(n_kv, (const ggml_fp16_t *)this_m, score_c);
-                }
+                iqk_indexer_mask_row(m, iq, 0, n_kv, score_c);
                 auto idx = (const int32_t *)c->data;
                 for (int j = 0; j < n_kv; ++j) score_c[j] += score[idx[j]];
                 std::partial_sort(sorted, sorted + n_top_k, sorted + n_kv, [score_c] (int32_t l, int32_t r) -> bool { return score_c[l] > score_c[r]; });
@@ -2347,16 +2447,11 @@ bool iqk_indexer_topk(struct ggml_tensor * dst, void * work_buffer, barrier_t ba
     for (int iq = 0; iq < q->ne[2]; ++iq) {
         if (n_this_thread > 0) {
             auto this_q = q_data + iq*qnb2;
-            auto this_m = (const char *)m->data + iq*m->nb[1];
             auto this_w = (const float *)((const char *)w->data + w->nb[1]*iq);
             DataInfo info{kq_th, this_q, (size_t)n_this_thread, (size_t)row_size_q, 0, 1, nullptr, 0};
             mm.mul_mat_NxM(k->ne[0], (const char *)k->data + first*k->nb[1], k->nb[1], info, n_this_thread, q->ne[1]);
             if (!c) {
-                if (m->type == GGML_TYPE_F32) {
-                    std::memcpy(score_th, this_m + first*sizeof(float), n_this_thread*sizeof(float));
-                } else {
-                    iqk_f16_to_f32(n_this_thread, (const ggml_fp16_t *)this_m + first, score_th);
-                }
+                iqk_indexer_mask_row(m, iq, first, n_this_thread, score_th);
             } else {
                 for (int j = 0; j < n_this_thread; ++j) score_th[j] = 0.0f;
             }
@@ -2373,11 +2468,7 @@ bool iqk_indexer_topk(struct ggml_tensor * dst, void * work_buffer, barrier_t ba
         barrier(barrier_data);
         if (ith == 0) {
             if (c) {
-                if (m->type == GGML_TYPE_F32) {
-                    std::memcpy(score_c, (const char *)m->data + iq*m->nb[1], n_kv*sizeof(float));
-                } else {
-                    iqk_f16_to_f32(n_kv, (const ggml_fp16_t *)((const char *)m->data + iq*m->nb[1]), score_c);
-                }
+                iqk_indexer_mask_row(m, iq, 0, n_kv, score_c);
                 auto idx = (const int32_t *)c->data;
                 for (int j = 0; j < n_kv; ++j) score_c[j] += score[idx[j]];
             }
@@ -2420,7 +2511,8 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long, long, long, int, int, const void *
 extern "C" IQK_API bool iqk_moe_fused_up_gate(long /*Nx*/, long /*Ny*/, long /*ne00*/, int /*ne11*/, int /*unary_op*/,
         int /*typeA*/, const void * /*Aup*/, const void * /*Agate*/, long /*strideA*/,
         int /*typeB*/, const void * /*B*/, long /*strideB*/,
-        float * /*C*/, long /*nb1*/, long /*nb2*/, const void * /*vrow_mapping*/, float, int /*ith*/, int /*nth*/) {
+        float * /*C*/, long /*nb1*/, long /*nb2*/, const void * /*vrow_mapping*/, float,
+        float, float, int /*ith*/, int /*nth*/) {
     GGML_ABORT("Unsupported CPU. You may need to manually set compilation flags\n");
     return false;
 }

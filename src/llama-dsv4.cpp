@@ -815,7 +815,8 @@ static llama_context::dsv4_runtime::comp_plan dsv4_build_comp_plan(
         }
     }
 
-    if (overlap && plan.state_write_idxs.empty() && !plan.state_pos.empty()) {
+    if ((overlap || (ratio <= llama_context::dsv4_runtime::CSA_RATIO && plan.n_kv > 0)) &&
+            plan.state_write_idxs.empty() && !plan.state_pos.empty()) {
         const llama_seq_id seq_id0 =
                 batch.n_seq_id != nullptr && batch.seq_id != nullptr && batch.n_seq_id[0] > 0 && batch.seq_id[0] != nullptr
                 ? batch.seq_id[0][0]
@@ -823,6 +824,9 @@ static llama_context::dsv4_runtime::comp_plan dsv4_build_comp_plan(
         const uint32_t source_idx = (uint32_t) state_source_idx(seq_id0, batch.pos[0]);
         const int64_t cache_off = std::max<int64_t>(0, dsv4_stream_offset(n_stream, seq_id0, kv_size));
         plan.state_write_idxs.push_back(cache_off + (int64_t) kv_size - 1);
+        if (kv_size_lid > 0) {
+            plan.state_write_idxs_lid.push_back(dsv4_stream_offset(n_stream, seq_id0, kv_size_lid) + (int64_t) kv_size_lid - 1);
+        }
         plan.state_write_pos.push_back(0);
 
         if (overlap) {
@@ -1949,7 +1953,11 @@ bool llama_prepare_dsv4_graph_inputs(llama_context & lctx, const llama_batch & b
         dsv4_set_input_tensor(inputs.state_write_idxs_lid, plan.state_write_idxs_lid);
         dsv4_set_input_tensor(inputs.state_write_pos, plan.state_write_pos);
         if (set_mask) {
-            dsv4_set_mask_tensor(inputs.kq_mask, plan, batch.n_tokens);
+            if (inputs.n_visible) {
+                dsv4_set_input_tensor(inputs.n_visible, plan.n_visible);
+            } else {
+                dsv4_set_mask_tensor(inputs.kq_mask, plan, batch.n_tokens);
+            }
             dsv4_set_cand_pin(inputs.cand_pin, plan, batch.n_tokens);
         }
     };

@@ -494,6 +494,7 @@ extern "C" {
         GGML_TYPE_IQ5_KS_R16 = 347,
         GGML_TYPE_IQ5_KS_R4  = 352,
         GGML_TYPE_MXFP4_R8   = 353,
+        GGML_TYPE_Q8_0_R16   = 396,
         GGML_TYPE_Q8_K_R16   = 397,
         GGML_TYPE_Q8_KV_R8   = 398,
         GGML_TYPE_Q8_K_R8    = 399,
@@ -729,6 +730,8 @@ extern "C" {
         GGML_OP_LATENT_ATTN,
         GGML_OP_DS4_COMP,
 
+        GGML_OP_FMA,
+
         GGML_OP_COUNT,
     };
 
@@ -752,6 +755,7 @@ extern "C" {
         GGML_UNARY_OP_EXP,
         GGML_UNARY_OP_SOFTPLUS,
         GGML_UNARY_OP_SQRT_SOFTPLUS,
+        GGML_UNARY_OP_SITU_GLU,
 
         GGML_UNARY_OP_COUNT,
     };
@@ -1442,6 +1446,20 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 alpha,
             float                 limit);
+
+    // c + a*b. a and b must be broadcastable to c
+    GGML_API struct ggml_tensor * ggml_fma(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
+    // c += a*b. a and b must be broadcastable to c
+    GGML_API struct ggml_tensor * ggml_fma_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
 
     //
     // *** from mainline begin ***
@@ -2473,6 +2491,13 @@ extern "C" {
             struct ggml_tensor  * mask,
             struct ggml_tensor  * topk);
 
+    // n_visible is I32 [1, n_rows]; row i of the result is 0 in its first n_visible[i] columns, -INFINITY after
+    GGML_API struct ggml_tensor * ggml_visible_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * n_visible,
+            int64_t               n_kv,
+            enum ggml_type        type);
+
 
     // sort rows
     enum ggml_sort_order {
@@ -2737,6 +2762,14 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_mask_to_index(
             struct ggml_context * ctx,
             struct ggml_tensor  * mask,
+            int                   max_row_size);
+
+    // ggml_mask_to_index(concat(mask, ggml_indexer_mask(ggml_visible_mask(n_visible), topk), 0), max_row_size) without the concat
+    GGML_API struct ggml_tensor * ggml_mask_to_index_topk(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * topk,
+            struct ggml_tensor  * n_visible,
             int                   max_row_size);
 
     GGML_API struct ggml_tensor * ggml_ds4_comp(

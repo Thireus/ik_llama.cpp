@@ -66,6 +66,7 @@ llm_build_context::llm_build_context(
         norm_eps         (hparams.f_norm_eps),
         norm_rms_eps     (hparams.f_norm_rms_eps),
         n_tokens         (batch.n_tokens),
+        n_tokens_seg     (batch.n_tokens),
         n_kv             (worst_case ? kv_self.size : kv_self.n),
         n_outputs        (worst_case ? n_outputs_ > 0 ? n_outputs_ : n_tokens : lctx.n_outputs),
         n_outputs_enc    (worst_case ? n_tokens : lctx.embd_enc.size() / hparams.n_embd),
@@ -88,6 +89,7 @@ llm_build_context::llm_build_context(
         pooling_type     (cparams.pooling_type),
         rope_type        (hparams.rope_type),
         clear_lctx_inputs(clear_lctx_inputs),
+        worst_case       (worst_case),
         cb               (cb),
         buf_compute_meta (buf_compute_meta_override ? *buf_compute_meta_override : lctx.buf_compute_meta) {
             // all initializations should be done in init()
@@ -1289,10 +1291,11 @@ ggml_tensor * llm_build_context::llm_build_ffn(
 
     if (!up_b && !up_s && !gate_b && !gate_s && !down_b && !down_s &&
         up->extra && gate->extra && down->extra && type_gate == LLM_FFN_PAR &&
-        (type_op == LLM_FFN_SILU || type_op == LLM_FFN_RELU || type_op == LLM_FFN_SWIGLU_OAI || (type_op == LLM_FFN_GELU && !act_scales))) {
+        (type_op == LLM_FFN_SILU || type_op == LLM_FFN_RELU || type_op == LLM_FFN_SWIGLU_OAI || (type_op == LLM_FFN_SITU && lctx.model.n_gpu_layers == 0) || (type_op == LLM_FFN_GELU && !act_scales))) {
         auto unary_op = type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
                         type_op == LLM_FFN_RELU ? GGML_UNARY_OP_RELU :
-                        type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI;
+                        type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU :
+                        type_op == LLM_FFN_SITU ? GGML_UNARY_OP_SITU_GLU : GGML_UNARY_OP_SWIGLU_OAI;
         auto u = (ggml_split_tensor_t *)up->extra;
         auto g = (ggml_split_tensor_t *)gate->extra;
         auto d = (ggml_split_tensor_t *)down->extra;
@@ -1317,6 +1320,8 @@ ggml_tensor * llm_build_context::llm_build_ffn(
             cur = ggml_fused_up_gate(ctx, split_u, split_g, cur, unary_op);
             cb(cur, "ffn_up_gate", il_cb);
             *(float *)(cur->op_params + 1) = lctx.model.swiglu_limit(il, lctx.model.arch == LLM_ARCH_BAILINGMOE3);
+            *(float *)(cur->op_params + 2) = lctx.model.hparams.situ_beta;
+            *(float *)(cur->op_params + 3) = lctx.model.hparams.situ_linear_beta;
             cur = llm_build_lora_mm(lctx, ctx, split_d, cur);
             cb(cur, "ffn_down", il_cb);
             if (lctx.model.arch == LLM_ARCH_GLM4 || lctx.model.arch == LLM_ARCH_GLM4_MOE) {
@@ -1326,10 +1331,9 @@ ggml_tensor * llm_build_context::llm_build_ffn(
             if (cur->ne[1] > 32 && lctx.cparams.reduce_type != GGML_TYPE_F32) {
                 cur = ggml_cast(ctx, cur, lctx.cparams.reduce_type);
             }
-            if (add_extra && add_extra->op == GGML_OP_REDUCE && add_extra->op_params[3] == 1) {
+            if (add_extra && add_extra->op == GGML_OP_REDUCE && add_extra->op_params[3] == 1 && add_extra->src[id]) {
                 // When the reduce op is turned off via op_params[3] == 1, we need to add each src
                 // rtaher than add the reduced add_extra result to the ffn reduced ffn result.
-                GGML_ASSERT(add_extra->src[id]); // TODO: fix this! It can be null if the splits of the attention and ffn tensors are different
                 cur = ggml_add(ctx, cur, add_extra->src[id]);
                 cb(cur, "ffn_with_extra", il_cb);
             }
@@ -1377,13 +1381,16 @@ ggml_tensor * llm_build_context::llm_build_ffn(
         up->type != GGML_TYPE_PTQ1_0 && up->type != GGML_TYPE_PTQ1_0_R8 &&
         lctx.model.hadamard_rotation(up) == nullptr && lctx.model.hadamard_rotation(gate) == nullptr &&
         !up_b && !up_s && !gate_b && !gate_s && type_gate == LLM_FFN_PAR &&
-        (type_op == LLM_FFN_SILU || type_op == LLM_FFN_RELU || type_op == LLM_FFN_SWIGLU_OAI || (type_op == LLM_FFN_GELU && !act_scales))) {
+        (type_op == LLM_FFN_SILU || type_op == LLM_FFN_RELU || type_op == LLM_FFN_SWIGLU_OAI || (type_op == LLM_FFN_SITU && lctx.model.n_gpu_layers == 0) || (type_op == LLM_FFN_GELU && !act_scales))) {
         auto unary_op = type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
                         type_op == LLM_FFN_RELU ? GGML_UNARY_OP_RELU :
-                        type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI;
+                        type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU :
+                        type_op == LLM_FFN_SITU ? GGML_UNARY_OP_SITU_GLU : GGML_UNARY_OP_SWIGLU_OAI;
         cur = ggml_fused_up_gate(ctx, up, gate, cur, unary_op);
         cb(cur, "ffn_up_gate", il);
         *(float *)(cur->op_params + 1) = lctx.model.swiglu_limit(il, true);
+        *(float *)(cur->op_params + 2) = lctx.model.hparams.situ_beta;
+        *(float *)(cur->op_params + 3) = lctx.model.hparams.situ_linear_beta;
         if (down) {
             cur = llm_build_lora_mm(lctx, ctx, down, cur);
             cb(cur, "ffn_down", il);
@@ -1469,6 +1476,19 @@ ggml_tensor * llm_build_context::llm_build_ffn(
     else {
 
     switch (type_op) {
+        case LLM_FFN_SITU:
+            {
+                const auto & hp = lctx.model.hparams;
+                auto situ_gate = [&](ggml_tensor * x, float beta) {
+                    return ggml_mul(ctx, ggml_softcap(ctx, x, 1.0f/beta, beta), ggml_sigmoid(ctx, x));
+                };
+                auto situ_up = [&](ggml_tensor * x, float beta) {
+                    return beta > 0.0f ? ggml_softcap(ctx, x, 1.0f/beta, beta) : x;
+                };
+                cur = ggml_mul(ctx, situ_gate(cur, hp.situ_beta), situ_up(tmp, hp.situ_linear_beta));
+                type_gate = LLM_FFN_SEQ;
+                cb(cur, "ffn_situ", il);
+            } break;
         case LLM_FFN_SILU:
             {
                 if (lctx.model.arch == LLM_ARCH_STEP35 || lctx.model.arch == LLM_ARCH_BAILINGMOE3) {
@@ -1746,22 +1766,27 @@ llm_expert_gating_func_type   gating_op,
     // Hence, if we have biases, we cannot use fmoe.
     //
     //bool can_use_fmoe = !up_exps_b && !gate_exps_b && (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU);
-    bool can_use_fmoe = (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU || type_op == LLM_FFN_SWIGLU_OAI);
+    bool can_use_fmoe = (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU ||
+                         type_op == LLM_FFN_SWIGLU_OAI ||
+                         (type_op == LLM_FFN_SITU && lctx.model.n_gpu_layers == 0));
 
     ggml_tensor * par;
     if (can_use_fmoe && up_gate_exps && (!cache_ids || !up_gate_exps_b)) {
         ggml_tensor * weight = cached_up_gate ? cached_up_gate : up_gate_exps;
         ggml_tensor * expert_ids = cache_ids ? cache_ids : selected_experts;
-        if (up_gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI) {
+        if (up_gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI || type_op == LLM_FFN_SITU) {
             par = ggml_moe_up_gate_ext(ctx, weight, nullptr, cur, expert_ids, up_gate_exps_b, nullptr,
                     type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
-                    type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
+                    type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU :
+                    type_op == LLM_FFN_SITU ? GGML_UNARY_OP_SITU_GLU : GGML_UNARY_OP_SWIGLU_OAI);
         } else {
             GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI);
             par = ggml_moe_up_gate(ctx, weight, nullptr, cur, expert_ids,
                     type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
         }
         *((float *)(par->op_params + 1)) = lctx.model.swiglu_limit(il, false);
+        *((float *)(par->op_params + 2)) = lctx.model.hparams.situ_beta;
+        *((float *)(par->op_params + 3)) = lctx.model.hparams.situ_linear_beta;
     } else {
     if (up_gate_exps) {
         GGML_ASSERT(cache_ids && cached_up_gate);
@@ -1781,6 +1806,15 @@ llm_expert_gating_func_type   gating_op,
             *((float *)(par->op_params + 1)) = lctx.model.swiglu_limit(il, false);
         } else if (type_op == LLM_FFN_SWIGLU_OAI) {
             par = ggml_swiglu_oai(ctx, gate, up, 1.702f, 7.0f);
+        } else if (type_op == LLM_FFN_SITU) {
+            const auto & hp = lctx.model.hparams;
+            auto situ_gate = [&](ggml_tensor * x, float beta) {
+                return ggml_mul(ctx, ggml_softcap(ctx, x, 1.0f/beta, beta), ggml_sigmoid(ctx, x));
+            };
+            auto situ_up = [&](ggml_tensor * x, float beta) {
+                return beta > 0.0f ? ggml_softcap(ctx, x, 1.0f/beta, beta) : x;
+            };
+            par = ggml_mul(ctx, situ_gate(gate, hp.situ_beta), situ_up(up, hp.situ_linear_beta));
         } else {
             GGML_ABORT("fatal error");
         }
@@ -1793,16 +1827,19 @@ llm_expert_gating_func_type   gating_op,
         ggml_tensor * up_weight = cached_up ? cached_up : up_exps;
         ggml_tensor * gate_weight = cached_gate ? cached_gate : gate_exps;
         ggml_tensor * expert_ids = cache_ids ? cache_ids : selected_experts;
-        if (up_exps_b || gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI) {
+        if (up_exps_b || gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI || type_op == LLM_FFN_SITU) {
             par = ggml_moe_up_gate_ext(ctx, up_weight, gate_weight, cur, expert_ids, up_exps_b, gate_exps_b,
                     type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
-                    type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
+                    type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU :
+                    type_op == LLM_FFN_SITU ? GGML_UNARY_OP_SITU_GLU : GGML_UNARY_OP_SWIGLU_OAI);
         } else {
             GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI);
             par = ggml_moe_up_gate(ctx, up_weight, gate_weight, cur, expert_ids,
                     type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
         }
         *(float *)(par->op_params + 1) = lctx.model.swiglu_limit(il, false);
+        *(float *)(par->op_params + 2) = lctx.model.hparams.situ_beta;
+        *(float *)(par->op_params + 3) = lctx.model.hparams.situ_linear_beta;
     } else {
         ggml_tensor * up = llm_build_lora_mm_id(lctx, ctx, up_exps, cur, selected_experts, cached_up, cache_ids); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
@@ -1833,6 +1870,15 @@ llm_expert_gating_func_type   gating_op,
             constexpr float alpha = 1.702f;
             constexpr float limit = 7.0f;
             par = ggml_swiglu_oai(ctx, gate, up, alpha, limit);
+        } else if (type_op == LLM_FFN_SITU) {
+            const auto & hp = lctx.model.hparams;
+            auto situ_gate = [&](ggml_tensor * x, float beta) {
+                return ggml_mul(ctx, ggml_softcap(ctx, x, 1.0f/beta, beta), ggml_sigmoid(ctx, x));
+            };
+            auto situ_up = [&](ggml_tensor * x, float beta) {
+                return beta > 0.0f ? ggml_softcap(ctx, x, 1.0f/beta, beta) : x;
+            };
+            par = ggml_mul(ctx, situ_gate(gate, hp.situ_beta), situ_up(up, hp.situ_linear_beta));
         }
         else {
             GGML_ABORT("fatal error");
@@ -2145,8 +2191,7 @@ llm_expert_gating_func_type   gating_op,
         } else {
             cur = routed_out;
         }
-        if (add_extra && add_extra->op == GGML_OP_REDUCE && add_extra->op_params[3] == 1) {
-            GGML_ASSERT(add_extra->src[id]); // TODO: fix this! It can be null if the splits of the attention and ffn tensors are different
+        if (add_extra && add_extra->op == GGML_OP_REDUCE && add_extra->op_params[3] == 1 && add_extra->src[id]) {
             cur = ggml_add(ctx, cur, add_extra->src[id]);
             cb(cur, "ffn_with_extra", il_cb);
         }
@@ -2167,6 +2212,11 @@ llm_expert_gating_func_type   gating_op,
     if (add_extra && !(add_extra->op == GGML_OP_REDUCE && add_extra->op_params[3] == 1)) {
         results[last_id] = ggml_add(ctx, results[last_id], add_extra);
         cb(results[last_id], "ffn_with_inp", il);
+    }
+    if (add_extra && add_extra->op == GGML_OP_REDUCE && add_extra->op_params[3] == 1) {
+        for (int id = 0; id < n_device; ++id) {
+            if (!results[id]) results[id] = add_extra->src[id];
+        }
     }
 
     auto cur = ggml_reduce(ctx, results.data(), n_device, GGML_OP_ADD);
@@ -2278,7 +2328,7 @@ static ggml_tensor * llm_build_kqv(
                 hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         cb(cur, "fa", il);
         ggml_flash_attn_ext_add_sinks(cur, sinks);
-        if (n_swa > 0 && !kv.cells_disordered) {
+        if (n_swa > 0 && !kv.cells_disordered && cparams.n_seq_max == 1) {
             ((int32_t *)cur->op_params)[4] = n_swa;
         }
 
@@ -3240,6 +3290,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             {
                 result = llm.build_glm5next();
             } break;
+        case LLM_ARCH_RAON1:
+            {
+                result = llm.build_raon1();
+            } break;
         case LLM_ARCH_MINIMAX_M2:
             {
                 result = llm.build_minimaxm2();
@@ -3251,6 +3305,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
         case LLM_ARCH_SMOLLM3:
             {
                 result = llm.build_smollm3();
+            } break;
+        case LLM_ARCH_SPARK2_5:
+            {
+                result = llm.build_spark2_5();
             } break;
         case LLM_ARCH_MISTRAL3:
             {
@@ -3539,7 +3597,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 } else {
                     ggml_flash_attn_ext_add_sinks(cur, sinks);
                 }
-                if (n_swa > 0 && !lctx.kv_self.cells_disordered) {
+                if (n_swa > 0 && !lctx.kv_self.cells_disordered && cparams.n_seq_max == 1) {
                     ((int32_t *)cur->op_params)[4] = n_swa;
                 }
                 // Some models produced NaNs/gibberish when FA is computed with f16 precision on CUDA

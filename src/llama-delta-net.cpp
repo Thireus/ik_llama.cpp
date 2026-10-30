@@ -290,7 +290,7 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
         int64_t head_k_dim, int64_t num_k_heads, int64_t head_v_dim, int64_t num_v_heads, int64_t ssm_d_conv,
         int64_t state_seq_id_local, uint32_t qnext_state_slots, bool reset_state_local,
         float eps_norm, int repeat_type, int il, const llm_build_cb & cb, ggml_cgraph * gf,
-        ggml_tensor * per_step_ckpt, ggml_tensor * per_step_conv) {
+        ggml_tensor * per_step_ckpt, ggml_tensor * per_step_conv, ggml_tensor * rda_delta) {
     const int64_t key_dim        = head_k_dim * num_k_heads;
     const int64_t value_dim      = head_v_dim * num_v_heads;
     const int64_t conv_dim       = key_dim * 2 + value_dim;
@@ -375,6 +375,17 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     cb(q_conv, "q_conv_normed", il);
     cb(k_conv, "k_conv_normed", il);
 
+    if (rda_delta) {
+        // RDA: beta is raw; the kernel sigmoids it. V *= write/erase gives
+        // S' = S(I - erase k k^T) + write v k^T exactly.
+        auto beta_v  = ggml_reshape_4d(ctx0, beta,      1, num_v_heads, n_seq_tokens, n_seqs);
+        auto delta_v = ggml_reshape_4d(ctx0, rda_delta, 1, num_v_heads, n_seq_tokens, n_seqs);
+        auto erase = ggml_softplus(ctx0, ggml_neg(ctx0, beta_v));
+        auto write = ggml_softplus(ctx0, ggml_neg(ctx0, ggml_add(ctx0, beta_v, delta_v)));
+        v_conv = ggml_mul(ctx0, v_conv, ggml_exp(ctx0, ggml_sub(ctx0, erase, write)));
+        cb(v_conv, "rda_v_scaled", il);
+    }
+
     auto [output, new_state] = build_fused_delta_net(ctx0, q_conv, k_conv, v_conv, gate, beta, state, il, cb, repeat_type,
             per_step_ckpt);
 
@@ -413,11 +424,7 @@ ggml_tensor * delta_net::build_gated_output(llama_context & lctx, ggml_context *
 
     ggml_tensor * attn_out_norm = llm_build_context::llm_build_norm(ctx0, attn_out_2d, lctx.model.hparams, ssm_norm, nullptr, LLM_NORM_RMS, cb, il);
     cb(attn_out_norm, "attn_rms_norm", il);
-    // the fused form only takes SILU when both operands share a shape, so the sigmoid
-    // gate is spelled out
-    attn_out_norm = gate_op == GGML_UNARY_OP_SIGMOID
-        ? ggml_mul(ctx0, attn_out_norm, ggml_sigmoid(ctx0, z_2d))
-        : ggml_fused_mul_unary(ctx0, z_2d, attn_out_norm, gate_op);
+    attn_out_norm = ggml_fused_mul_unary(ctx0, z_2d, attn_out_norm, gate_op);
     cb(attn_out_norm, "attn_out_norm", il);
 
     ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim*num_v_heads, n_tok);

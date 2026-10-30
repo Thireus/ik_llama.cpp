@@ -620,6 +620,7 @@ struct llama_context {
             struct ggml_tensor * cand_pin = nullptr;
             struct ggml_tensor * state_write_pos = nullptr;
             struct ggml_tensor * kq_mask = nullptr;
+            struct ggml_tensor * n_visible = nullptr;
         };
 
         struct storage {
@@ -740,6 +741,12 @@ struct llama_context {
         int64_t w_view    = 0;
         int64_t win_off   = 0;
     } swa_window_view;
+
+    // keep slice chosen by the builder for this ubatch, read by the capture row accounting
+    struct dsv41_replay_state {
+        bool    active = false;
+        int64_t keep   = 0;
+    } dsv41_replay;
 
     // multi-head MTP chaining state: head k's output row at the last committed position,
     // written back after each warmup/update decode and fed into the next MTP graph through

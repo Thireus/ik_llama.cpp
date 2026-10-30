@@ -524,45 +524,47 @@ ggml_backend_buffer_type_t llama_model::default_buffer_type_offload(int device) 
     return llama_default_buffer_type_offload(*this, device);
 }
 
-static size_t llama_get_device_memory(const llama_model & model, int device) {
+static bool llama_get_device_memory_info(const llama_model & model, int device, size_t & free, size_t & total) {
+    GGML_UNUSED(model);
 #if defined(GGML_USE_RPC)
     int dev_count = (int)llama_get_device_count(model);
     int rpc_count = (int)model.rpc_servers.size();
     if (device >= dev_count - rpc_count) {
-        size_t total;
-        size_t free;
         rpc_device rpc = model.rpc_servers[device - dev_count + rpc_count];
         const char * endpoint = rpc.endpoint.c_str();
         ggml_backend_rpc_get_device_memory(endpoint, rpc.device, &free, &total);
-        return free;
+        return true;
     }
 #endif
 #if defined(GGML_USE_CUDA)
-    size_t total;
-    size_t free;
     ggml_backend_cuda_get_device_memory(device, &free, &total);
-    return free;
+    return true;
 #elif defined(GGML_USE_SYCL)
-    size_t total;
-    size_t free;
     ggml_backend_sycl_get_device_memory(device, &free, &total);
-    return free;
+    return true;
 #elif defined(GGML_USE_VULKAN)
-    size_t total;
-    size_t free;
     ggml_backend_vk_get_device_memory(device, &free, &total);
-    return free;
+    return true;
 #elif defined(GGML_USE_CANN)
-    size_t total;
-    size_t free;
     ggml_backend_cann_get_device_memory(device, &free, &total);
-    return free;
+    return true;
 #elif defined(GGML_USE_METAL)
-    size_t total;
-    size_t free;
     ggml_backend_metal_get_device_memory(&free, &total);
-    return free;
+    return true;
 #else
+    GGML_UNUSED(device);
+    GGML_UNUSED(free);
+    GGML_UNUSED(total);
+    return false;
+#endif
+}
+
+static size_t llama_get_device_memory(const llama_model & model, int device) {
+    size_t free  = 0;
+    size_t total = 0;
+    if (llama_get_device_memory_info(model, device, free, total)) {
+        return free;
+    }
     // CPU-only build: report free host RAM instead of the 1-byte placeholder.
 #if defined(_WIN32)
     MEMORYSTATUSEX st = {};
@@ -586,7 +588,6 @@ static size_t llama_get_device_memory(const llama_model & model, int device) {
     }
 #endif
     return 1;
-#endif
     GGML_UNUSED(model);
     GGML_UNUSED(device);
 }
@@ -2634,6 +2635,7 @@ bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched,llama_ckpt_data
 static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
     for (int32_t i = 0; i < (int32_t) cache.size; ++i) {
         cache.cells[i].pos = -1;
+        cache.cells[i].tok = -1;
         cache.cells[i].src = i;
         cache.cells[i].seq_id.clear();
     }
@@ -7418,7 +7420,7 @@ static int llama_decode_internal(
     const auto & hparams = model.hparams;
     const auto & cparams = lctx.cparams;
 
-    llama_begin_dflash_capture_batch(&lctx, (int32_t) n_tokens_all);
+    llama_begin_dflash_capture_batch(&lctx, (int32_t) n_tokens_all, true);
 
     GGML_ASSERT((!batch_all.token && batch_all.embd) || (batch_all.token && !batch_all.embd)); // NOLINT
 
@@ -7810,6 +7812,10 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING == 1
         tim1 = ggml_time_us();
 #endif
+        if (lctx.dflash.capture) {
+            llama_begin_dflash_capture_batch(&lctx, lctx.dsv41_replay.active
+                    ? (int32_t) lctx.dsv41_replay.keep : (int32_t) n_tokens, false);
+        }
         //fprintf(stderr, "%s: setting inputs\n", __func__);
         llama_set_inputs(lctx, u_batch);
 #if IK_PRINT_TIMING == 1
@@ -8961,6 +8967,7 @@ struct llama_context_params llama_context_default_params() {
         /*.dsa                         =*/ false,
         /*.fused_idx_topk              =*/ true,
         /*.swa_compress                =*/ false,
+        /*.dsv41_replay_keep           =*/ 0,
         /*.dsv4_legacy_state           =*/ false,
         /*.dsa_top_k                   =*/ -1,
         /*.min_experts                 =*/ -1,
@@ -9480,6 +9487,21 @@ struct llama_context * llama_init_from_model(
     cparams.dsa              = params.dsa;
     cparams.fused_idx_topk   = params.fused_idx_topk;
     cparams.swa_compress     = params.swa_compress;
+    cparams.dsv41_replay_keep = params.dsv41_replay_keep;
+    if (cparams.dsv41_replay_keep > 0) {
+        if (model->arch != LLM_ARCH_DEEPSEEK41) {
+            LLAMA_LOG_WARN("%s: --dsv41-replay-keep is only implemented for DeepSeek-V4.1; ignoring\n", __func__);
+            cparams.dsv41_replay_keep = 0;
+        } else if (!cparams.swa_compress) {
+            LLAMA_LOG_WARN("%s: --dsv41-replay-keep requires --swa-compress; ignoring\n", __func__);
+            cparams.dsv41_replay_keep = 0;
+        } else if (cparams.dsv41_replay_keep < (int) hparams.n_swa + 6) {
+            const int min_keep = (int) hparams.n_swa + 6;
+            LLAMA_LOG_WARN("%s: --dsv41-replay-keep %d is below n_swa + 6 (%d); using %d\n", __func__,
+                    cparams.dsv41_replay_keep, min_keep, min_keep);
+            cparams.dsv41_replay_keep = min_keep;
+        }
+    }
     cparams.dsv4_legacy_state = params.dsv4_legacy_state;
     cparams.dsa_top_k        = params.dsa_top_k;
 
@@ -10186,6 +10208,176 @@ const struct llama_model * llama_get_model(const struct llama_context * ctx) {
     return &ctx->model;
 }
 
+struct llama_memory_rows {
+    std::vector<llama_memory_row> rows;
+    std::vector<ggml_backend_buffer_type_t> bufts;
+    size_t i_host = 0;
+
+    llama_memory_row & add(const char * name, ggml_backend_buffer_type_t buft, bool is_device) {
+        llama_memory_row row = {};
+        snprintf(row.name, sizeof(row.name), "%s", name);
+        row.is_device = is_device;
+        rows.push_back(row);
+        bufts.push_back(buft);
+        return rows.back();
+    }
+
+    std::vector<ggml_backend_buffer_t> seen;
+
+    void add_model_buffer(ggml_backend_buffer_t buf) {
+        if (!buf) {
+            return;
+        }
+        for (size_t i = 0; i < seen.size(); ++i) {
+            if (seen[i] == buf) {
+                return;
+            }
+        }
+        seen.push_back(buf);
+        find(ggml_backend_buffer_get_type(buf)).model += ggml_backend_buffer_get_size(buf);
+    }
+
+    void add_context_buffer(ggml_backend_buffer_t buf) {
+        if (buf) {
+            find(ggml_backend_buffer_get_type(buf)).context += ggml_backend_buffer_get_size(buf);
+        }
+    }
+
+    llama_memory_row & find(ggml_backend_buffer_type_t buft) {
+        for (size_t i = 0; i < i_host; ++i) {
+            if (bufts[i] == buft) {
+                return rows[i];
+            }
+        }
+        if (ggml_backend_buft_is_host(buft)) {
+            return rows[i_host];
+        }
+        for (size_t i = i_host + 1; i < rows.size(); ++i) {
+            if (bufts[i] == buft) {
+                return rows[i];
+            }
+        }
+        return add(ggml_backend_buft_name(buft), buft, false);
+    }
+};
+
+static void llama_memory_add_checkpoint(llama_memory_rows & res, const llama_kv_cache::gpu_checkpoint & ckpt) {
+    const std::vector<ggml_backend_buffer_t> * bufs[] = { &ckpt.shadow_bufs, &ckpt.per_step_bufs, &ckpt.dsv4_shadow_bufs, &ckpt.dsv4_per_step_shadow_bufs };
+    for (const std::vector<ggml_backend_buffer_t> * list : bufs) {
+        for (ggml_backend_buffer_t buf : *list) {
+            res.add_context_buffer(buf);
+        }
+    }
+}
+
+static void llama_memory_add_context(llama_memory_rows & res, const llama_context * ctx) {
+    const llama_model & model = ctx->model;
+    const ggml_backend_buffer_type_t cpu_buft = llama_default_buffer_type_cpu(true);
+
+    for (size_t i = 0; i < model.bufs.size(); ++i) {
+        res.add_model_buffer(model.bufs[i]);
+    }
+    for (size_t i = 0; i < model.layers.size(); ++i) {
+        const llama_layer & l = model.layers[i];
+        const std::shared_ptr<ggml_tensor> * derived[] = { &l.computed_wk_b, &l.computed_wk_b_pp, &l.computed_wv_b, &l.computed_wkv_b };
+        for (int j = 0; j < 4; ++j) {
+            if (*derived[j]) {
+                res.add_model_buffer((*derived[j])->buffer);
+            }
+        }
+        // The MLA loader sizes these to the device count and leaves a null entry for a device with no split.
+        const std::vector<std::shared_ptr<ggml_tensor>> * replicas[] = { &l.computed_wk_b_replicas, &l.computed_wk_b_pp_replicas, &l.computed_wv_b_replicas };
+        for (int j = 0; j < 3; ++j) {
+            for (const std::shared_ptr<ggml_tensor> & t : *replicas[j]) {
+                if (t) {
+                    res.add_model_buffer(t->buffer);
+                }
+            }
+        }
+    }
+    for (size_t i = 0; i < ctx->kv_self.bufs.size(); ++i) {
+        res.find(ggml_backend_buffer_get_type(ctx->kv_self.bufs[i])).context += ggml_backend_buffer_get_size(ctx->kv_self.bufs[i]);
+    }
+    if (ctx->buf_output) {
+        res.find(ggml_backend_buffer_get_type(ctx->buf_output)).context += ggml_backend_buffer_get_size(ctx->buf_output);
+    }
+    for (ggml_backend_buffer_t buf : ctx->dsv4.cache.cache_bufs) {
+        res.add_context_buffer(buf);
+    }
+    for (ggml_backend_buffer_t buf : ctx->dflash.kv.cache_bufs) {
+        res.add_context_buffer(buf);
+    }
+    if (ctx->moe_cache) {
+        for (const auto & [buft, size] : ctx->moe_cache->memory_breakdown()) {
+            res.find(buft).context += size;
+        }
+    }
+    llama_memory_add_checkpoint(res, ctx->kv_self.ckpt);
+    for (const std::unique_ptr<llama_kv_cache::gpu_checkpoint> & ckpt : ctx->kv_self.ckpt_rewind_pool) {
+        llama_memory_add_checkpoint(res, *ckpt);
+    }
+    const ggml_backend_sched_t scheds[] = { ctx->sched, ctx->dflash.kv.cache_sched };
+    for (ggml_backend_sched_t sched : scheds) {
+        if (!sched) {
+            continue;
+        }
+        for (size_t i = 0; i < ctx->backends.size(); ++i) {
+            ggml_backend_t backend = ctx->backends[i];
+            ggml_backend_buffer_type_t buft = ggml_backend_is_cpu(backend) ? cpu_buft : ggml_backend_get_default_buffer_type(backend);
+            const size_t size = ggml_backend_sched_get_buffer_size(sched, backend);
+            if (size > 1) {
+                res.find(buft).compute += size;
+            }
+        }
+    }
+}
+
+int32_t llama_memory_breakdown(
+        const struct llama_context * const * ctxs,
+                               int32_t   n_ctxs,
+        const struct llama_memory_buft * mmproj,
+                               int32_t   n_mmproj,
+              struct llama_memory_row * rows,
+                               int32_t   n_rows) {
+    std::vector<const llama_context *> unique;
+    for (int32_t i = 0; i < n_ctxs; ++i) {
+        if (ctxs[i] && std::find(unique.begin(), unique.end(), ctxs[i]) == unique.end()) {
+            unique.push_back(ctxs[i]);
+        }
+    }
+
+    llama_memory_rows res;
+    const ggml_backend_buffer_type_t cpu_buft = llama_default_buffer_type_cpu(true);
+    for (const llama_context * ctx : unique) {
+        const llama_model & model = ctx->model;
+        for (size_t i = 0; i < model.devices.size(); ++i) {
+            ggml_backend_buffer_type_t buft = llama_default_buffer_type_offload(model, model.devices[i]);
+            if (buft == cpu_buft || buft == ggml_backend_cpu_buffer_type() ||
+                std::find(res.bufts.begin(), res.bufts.end(), buft) != res.bufts.end()) {
+                continue;
+            }
+            llama_memory_row & row = res.add(ggml_backend_buft_name(buft), buft, true);
+            llama_get_device_memory_info(model, model.devices[i], row.free, row.total);
+        }
+    }
+    res.i_host = res.rows.size();
+    res.add("Host", nullptr, false);
+
+    for (const llama_context * ctx : unique) {
+        llama_memory_add_context(res, ctx);
+    }
+    for (int32_t i = 0; i < n_mmproj; ++i) {
+        if (mmproj[i].size > 0) {
+            res.find(mmproj[i].buft).mmproj += mmproj[i].size;
+        }
+    }
+
+    for (int32_t i = 0; i < n_rows && i < (int32_t) res.rows.size(); ++i) {
+        rows[i] = res.rows[i];
+    }
+    return (int32_t) res.rows.size();
+}
+
 const struct llama_vocab * llama_get_vocab(const struct llama_context * ctx) {
     return &ctx->model.vocab;
 }
@@ -10317,6 +10509,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_GEMMA4_ASSISTANT:
         case LLM_ARCH_LFM2:
         case LLM_ARCH_LFM2MOE:
+        case LLM_ARCH_SPARK2_5:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:
@@ -10328,6 +10521,9 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN4EXP:
             return LLAMA_ROPE_TYPE_IMROPE;
+
+        case LLM_ARCH_RAON1:
+            return LLAMA_ROPE_TYPE_NONE;
 
         // all model arches should be listed explicitly here
         case LLM_ARCH_UNKNOWN:
@@ -10968,11 +11164,10 @@ bool llama_rewind_ckpt_save(struct llama_context * ctx, llama_ckpt_data ckpt_typ
     return success;
 }
 
-bool llama_rewind_ckpt_discard(struct llama_context * ctx, llama_ckpt_data ckpt_type, llama_seq_id seq_id) {
+bool llama_rewind_ckpt_discard(struct llama_context * ctx, llama_ckpt_data ckpt_type, [[maybe_unused]] llama_seq_id seq_id) {
     auto & m = ctx->kv_self.ckpt_rewind_map;
     for (auto it = m.begin(); it != m.end(); ) {
         if (it->first < ckpt_type.pos || ckpt_type.pos <0) {
-            auto & ckpt = *it->second;
             auto new_type = ckpt_type;
             new_type.pos = it->first;
             llama_spec_ckpt_discard(ctx, new_type);
@@ -10984,7 +11179,7 @@ bool llama_rewind_ckpt_discard(struct llama_context * ctx, llama_ckpt_data ckpt_
     return true;
 }
 
-bool llama_rewind_ckpt_release(struct llama_context * ctx, llama_ckpt_data ckpt_type, llama_seq_id seq_id) {
+bool llama_rewind_ckpt_release(struct llama_context * ctx, llama_ckpt_data ckpt_type, [[maybe_unused]] llama_seq_id seq_id) {
     auto & m = ctx->kv_self.ckpt_rewind_map;
     for (auto it = m.begin(); it != m.end(); ) {
         if (it->first < ckpt_type.pos || ckpt_type.pos < 0) {
@@ -11203,8 +11398,11 @@ static inline ggml_tensor * get_kv_cache_split_tensor(const ggml_tensor * tensor
 }
 
 static constexpr uint32_t DSV4_STATE_MAGIC = 0x34565344u;
-static constexpr uint32_t DSV4_STATE_VER = 2; // used-rows layout with compression ratios and shared-streams flag
-static constexpr uint32_t DSV4_STATE_VER_SHARED = 3;
+static constexpr uint32_t DSV4_STATE_VER = 4; // used-rows layout with compression ratios and shared-streams flag, then the cell tokens
+static constexpr uint32_t DSV4_STATE_VER_SHARED = 5;
+// the same layouts without the cell tokens; still read, the restored cells keep tok = -1
+static constexpr uint32_t DSV4_STATE_VER_NO_TOK = 2;
+static constexpr uint32_t DSV4_STATE_VER_SHARED_NO_TOK = 3;
 
 static uint32_t dsv4_state_n_used_k_rows(llama_pos pos_max, uint32_t ratio, uint32_t kv_rows) {
     const uint64_t n_rows = ((uint64_t) std::max<llama_pos>(0, pos_max) + 1) / (ratio ? ratio : 1);
@@ -11679,6 +11877,15 @@ struct llama_data_write {
                     write_dsv4_cache(ctx, il, dsv4_stream_idx, dsv4_n_rows_csa, dsv4_n_rows_hca, dsv4_n_rows_lid);
                 }
             }
+
+            // the token of each saved cell: the DeepSeek-V4.1 engram reads the predecessors of a batch from the cells
+            if (!dsv4_legacy_state) {
+                for (const auto & range : cell_ranges) {
+                    for (uint32_t i = range.first; i < range.second; ++i) {
+                        write(&kv_self.cells[i].tok, sizeof(llama_token));
+                    }
+                }
+            }
         }
     }
 
@@ -11953,6 +12160,7 @@ struct llama_data_read {
                 if (i > 0 && pos < batch.pos[i - 1]) {
                     disordered = true;
                 }
+                batch.token[i] = -1;
                 batch.pos[i] = pos;
                 batch.n_seq_id[i] = 1;
                 batch.seq_id[i][0] = dest_seq_id;
@@ -12517,7 +12725,8 @@ struct llama_data_read {
             uint32_t dsv4_n_layer = 0;
             if (dsv4_ver2) {
                 read_to(&dsv4_ver, sizeof(dsv4_ver));
-                if (dsv4_ver != DSV4_STATE_VER && dsv4_ver != DSV4_STATE_VER_SHARED) {
+                if (dsv4_ver != DSV4_STATE_VER && dsv4_ver != DSV4_STATE_VER_SHARED &&
+                    dsv4_ver != DSV4_STATE_VER_NO_TOK && dsv4_ver != DSV4_STATE_VER_SHARED_NO_TOK) {
                     LLAMA_LOG_ERROR("%s: DSV4 state version mismatch (%u)\n", __func__, dsv4_ver);
                     return false;
                 }
@@ -12587,8 +12796,8 @@ struct llama_data_read {
             // Destination stream: when restoring per-stream, write to seq_id's slot
             const int32_t dsv4_dst_stream = dsv4_single_stream ? (int32_t)seq_id : -1;
 
-            const bool dsv4_restores_streams = !ctx->model.hparams.dsv4_shared_streams ||
-                    dsv4_ver == DSV4_STATE_VER_SHARED;
+            const bool dsv4_shared_layout = dsv4_ver == DSV4_STATE_VER_SHARED || dsv4_ver == DSV4_STATE_VER_SHARED_NO_TOK;
+            const bool dsv4_restores_streams = !ctx->model.hparams.dsv4_shared_streams || dsv4_shared_layout;
             if (dsv4_ver2 && dsv4_restores_streams) {
                 llama_reset_dsv4_state(ctx, dsv4_dst_stream);
             }
@@ -12618,7 +12827,7 @@ struct llama_data_read {
                     }
                 };
 
-                if (dsv4_ver == DSV4_STATE_VER_SHARED) {
+                if (dsv4_shared_layout) {
                     if (layer_type & 1u) {
                         set_tensor_stream(cache.csa_k[il], dsv4_n_rows_csa);
                         set_tensor_stream(cache.csa_state_kv[il]);
@@ -12648,6 +12857,12 @@ struct llama_data_read {
                 }
                 if (!set_ok) {
                     return false;
+                }
+            }
+
+            if (dsv4_ver == DSV4_STATE_VER || dsv4_ver == DSV4_STATE_VER_SHARED) {
+                for (uint32_t i = 0; i < cell_count; ++i) {
+                    read_to(&kv_self.cells[kv_self.head + i].tok, sizeof(llama_token));
                 }
             }
         }
