@@ -938,6 +938,10 @@ static int llama_openpangu_chunked_graph_nodes(const llama_model & model, const 
 int llama_context::max_nodes(int n_tokens, int n_kv) const {
     int max_nodes = model.max_nodes(n_tokens);
     max_nodes += llama_openpangu_chunked_graph_nodes(model, cparams, n_tokens, n_kv);
+    if (model.arch == LLM_ARCH_MINIMAX_M3 && !kv_self.kr_l.empty()) {
+        // build_minimaxm3 scores each MINIMAXM3_MSA_SCORE_CHUNK query rows separately, 16 nodes per chunk and layer
+        max_nodes += 16*model.hparams.n_layer*((n_tokens + MINIMAXM3_MSA_SCORE_CHUNK - 1)/MINIMAXM3_MSA_SCORE_CHUNK);
+    }
     if (model.arch == LLM_ARCH_DEEPSEEK41 && n_tokens > 0 && n_kv > 0) {
         const llama_hparams & hp = model.hparams;
         int64_t n_unfused = 0;
@@ -1430,7 +1434,9 @@ static bool llama_kv_cache_init(
     // pooling precedes the norm and the rotation that the other two arches fold in before caching.
     const bool has_qwen4exp_indexer =
         model.arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0;
-    if (has_glm_dsa_indexer || has_openpangu_dsa_indexer || has_qwen4exp_indexer) {
+    const bool has_minimax_m3_indexer =
+        model.arch == LLM_ARCH_MINIMAX_M3 && cparams.dsa && hparams.indexer_block_size > 0;
+    if (has_glm_dsa_indexer || has_openpangu_dsa_indexer || has_qwen4exp_indexer || has_minimax_m3_indexer) {
         cache.kr_l.resize(n_layer, nullptr);
     }
     if (has_qwen4exp_indexer) {
@@ -1635,6 +1641,12 @@ static bool llama_kv_cache_init(
                         (cache.rows(i) + ratio - 1)/ratio);
                 ggml_format_name(idxp, "cache_kp_l%d", i);
                 cache.kp_l[i] = idxp;
+            }
+
+            if (has_minimax_m3_indexer && model.layers[i].indexer_k_proj) {
+                ggml_tensor * idxk = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hparams.indexer_head_size, kv_size);
+                ggml_format_name(idxk, "cache_kr_l%d", i);
+                cache.kr_l[i] = idxk;
             }
 
             auto k_name = std::string{"cache_k_l"} + std::to_string(i);
@@ -4238,6 +4250,49 @@ static void llm_scale_gate_inp_s(llama_model & model, bool uses_mmap) {
     }
 }
 
+// Mainline GGUFs store the MiniMax-M3 indexer projections as F32, although their values are usually exact in BF16.
+static void llm_minimaxm3_indexer_to_bf16(llama_model & model, bool uses_mmap) {
+    std::vector<ggml_tensor *> exact;
+    size_t nbytes = 0;
+    for (auto & l : model.layers) {
+        for (auto t : { l.indexer_q_proj, l.indexer_k_proj }) {
+            if (!t || t->type != GGML_TYPE_F32) continue;
+            const uint32_t * u = (const uint32_t *)t->data;
+            const int64_t n = ggml_nelements(t);
+            int64_t i = 0;
+            while (i < n && (u[i] & 0xffff) == 0) ++i;
+            if (i < n) continue;
+            exact.push_back(t);
+            nbytes += n*sizeof(ggml_bf16_t);
+        }
+    }
+    if (exact.empty()) return;
+
+    char * dst = nullptr;
+    if (uses_mmap) {
+        model.aux_buffer.resize((nbytes + sizeof(float) - 1)/sizeof(float));
+        dst = (char *)model.aux_buffer.data();
+    }
+    std::vector<ggml_bf16_t> tmp;
+    for (auto t : exact) {
+        const uint32_t * u = (const uint32_t *)t->data;
+        const int64_t n = ggml_nelements(t);
+        tmp.resize(n);
+        // exact since the low half is zero; ggml_fp32_to_bf16_row would flush subnormals with AVX512_BF16
+        for (int64_t i = 0; i < n; ++i) tmp[i].bits = u[i] >> 16;
+        if (dst) {
+            t->data = dst;
+            dst += n*sizeof(ggml_bf16_t);
+        }
+        std::memcpy(t->data, tmp.data(), n*sizeof(ggml_bf16_t));
+        t->type  = GGML_TYPE_BF16;
+        t->nb[0] = sizeof(ggml_bf16_t);
+        for (int j = 1; j < GGML_MAX_DIMS; ++j) t->nb[j] = t->nb[j-1]*t->ne[j-1];
+    }
+    LLAMA_LOG_INFO("%s: %d F32 indexer tensors are exact in BF16, converted (%.2f MiB)\n", __func__,
+            (int) exact.size(), nbytes/1024./1024.);
+}
+
 // Backend (reg) enumeration
 static bool striequals(const char* a, const char* b) {
     for (; *a && *b; a++, b++) {
@@ -5500,6 +5555,9 @@ static bool llm_load_tensors(
     if (model.arch == LLM_ARCH_GEMMA4) {
         llm_scale_gate_inp_s(model, use_mmap_buffer);
     }
+    if (!dry_run && model.arch == LLM_ARCH_MINIMAX_M3 && model.dsa) {
+        llm_minimaxm3_indexer_to_bf16(model, ml.use_mmap);
+    }
     if ((model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || llm_arch_is_dflash_family(model.arch)) && extra_output_type != GGML_TYPE_COUNT) {
         llm_requantize_output_tensor(model, extra_output_type);
     }
@@ -5564,10 +5622,17 @@ static bool llm_load_tensors(
         int n_repacked = 0;
         int n_skipped = 0;
         if (!ml.use_mmap || keep_ple_mapping) {
+            // row views of a file weight keep the file type
+            std::unordered_set<const ggml_tensor *> viewed_weights;
+            for (auto& it : model.tensors_by_name) {
+                if (it.second->view_src && ml.get_weight(ggml_get_name(it.second->view_src))) {
+                    viewed_weights.insert(it.second->view_src);
+                }
+            }
             for (auto& it : model.tensors_by_name) {
                 if (ggml_backend_buffer_is_host(it.second->buffer)) {
                     auto orig_type = it.second->type;
-                    if (it.second->view_src) continue;
+                    if (it.second->view_src || viewed_weights.count(it.second)) continue;
                     if (tensor_is_file_aliased(it.second)) {
                         if ((ggml_type) iqk_repacked_type(it.second) != it.second->type) {
                             ++n_skipped;
@@ -5635,6 +5700,8 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
         model.hparams.vocab_only = params.vocab_only;
 
         model.mtp = params.mtp;
+        // MiniMax-M3 sparse attention runs only without GPU devices (see llama_init_from_model), so do not load its indexer
+        model.dsa = params.dsa && llama_get_device_count(model, 0) == 0;
 
         ml.defer_ple = params.defer_ple;
 
@@ -6044,6 +6111,29 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                         dst_tail[j * tail_w + t] = cell_of_pos[p];
                     }
                 }
+            }
+        }
+    }
+
+    if (lctx.inp_msa_cells) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_msa_cells->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_msa_bias->buffer));
+
+        const int32_t n_kv     = lctx.inp_msa_cells->ne[0];
+        const int32_t n_blocks = lctx.inp_msa_bias->ne[0];
+        const int32_t n_tokens = lctx.inp_msa_bias->ne[2];
+
+        int32_t * dst_cells = (int32_t *) lctx.inp_msa_cells->data;
+        for (int32_t i = 0; i < n_kv; ++i) {
+            dst_cells[i] = i;
+        }
+
+        // the ubatch sits in consecutive cells from kv_self.head, so query j belongs to the block of cell head + j
+        float * dst_bias = (float *) lctx.inp_msa_bias->data;
+        for (int32_t j = 0; j < n_tokens; ++j) {
+            const int32_t own = (kv_self.head + j)/(n_kv/n_blocks);
+            for (int32_t b = 0; b < n_blocks; ++b) {
+                dst_bias[j*n_blocks + b] = b == own ? INFINITY : 0.0f;
             }
         }
     }
@@ -8754,7 +8844,8 @@ static void llama_lora_adapter_init_internal(struct llama_model * model, const c
             ggml_free(ctx);
             throw std::runtime_error("LoRA tensor '" + name + "' does not exist in base model");
         }
-        struct ggml_context * dev_ctx = get_ctx_for_buft(ggml_backend_buffer_get_type(model_tensor->buffer));
+        struct ggml_context * dev_ctx = get_ctx_for_buft(ggml_backend_buffer_get_type(
+                model_tensor->buffer ? model_tensor->buffer : model_tensor->view_src->buffer));
         // validate tensor shape
         if (model_tensor->ne[0] != w.a->ne[0] || model_tensor->ne[1] != w.b->ne[1]) {
             gguf_free(ctx_gguf);
@@ -8899,6 +8990,7 @@ struct llama_model_params llama_model_default_params() {
         /*.merge_qkv                   =*/ false,
         /*.merge_up_gate_exps          =*/ false,
         /*.mtp                         =*/ false,
+        /*.dsa                         =*/ false,
         /*.dry_run                     =*/ false,
         /*.flash_attn                  =*/ true,
         /*.defer_experts               =*/ false,
@@ -9515,7 +9607,8 @@ struct llama_context * llama_init_from_model(
     // The DSA lightning indexer is built only in the layer-mode (non-TP) attention path. Under
     // -sm graph / -sm attn the model runs the tensor-parallel attention path, which has no indexer,
     // so --dsa would silently run dense MLA. Warn instead of degrading silently.
-    if (cparams.dsa && (model->split_mode == LLAMA_SPLIT_MODE_GRAPH || model->split_mode == LLAMA_SPLIT_MODE_ATTN)) {
+    if (cparams.dsa && model->arch != LLM_ARCH_MINIMAX_M3 &&
+            (model->split_mode == LLAMA_SPLIT_MODE_GRAPH || model->split_mode == LLAMA_SPLIT_MODE_ATTN)) {
         LLAMA_LOG_WARN("%s: --dsa is not active under -sm graph/attn (tensor-parallel attention has no indexer); running dense MLA\n", __func__);
     }
     cparams.prefetch_experts = params.prefetch_experts;
@@ -9901,6 +9994,21 @@ struct llama_context * llama_init_from_model(
             llama_set_cpu_affinity(ctx, params.cpu_affinity, params.n_cpu_affinity);
         }
 
+        // MiniMax-M3 sparse attention is implemented for the CPU backend only. A GPU backend can
+        // take part even with -ngl 0, because it pulls large batches of CPU-resident ops to itself.
+        if (cparams.dsa && model->arch == LLM_ARCH_MINIMAX_M3) {
+            const char * reason =
+                ctx->backends.size() > 1 ? "runs only when no GPU device is visible" :
+                !cparams.flash_attn      ? "needs flash attention" :
+                cparams.n_seq_max > 1    ? "supports a single sequence only" :
+                std::none_of(model->layers.begin(), model->layers.end(),
+                        [](const llama_layer & l) { return l.indexer_k_proj != nullptr; }) ? "found no indexer tensors" : nullptr;
+            if (reason) {
+                LLAMA_LOG_WARN("%s: MiniMax-M3 sparse attention %s; running dense attention\n", __func__, reason);
+                cparams.dsa = false;
+            }
+        }
+
         if (!llama_kv_cache_init(ctx->kv_self, ctx, type_k, type_v, params.idx_type_k, kv_size, cparams.offload_kqv,
                     params.type_k_first, params.type_k_last, params.type_v_first, params.type_v_last,
                     params.n_k_first, params.n_k_last, params.n_v_first, params.n_v_last)) {
@@ -9920,6 +10028,7 @@ struct llama_context * llama_init_from_model(
             size_t memory_size_k = 0;
             size_t memory_size_v = 0;
             size_t memory_size_k_indexer = 0;
+            ggml_type type_k_indexer = params.idx_type_k;
 
             for (auto & k : ctx->kv_self.k_l) {
                 if (k) {
@@ -9929,6 +10038,7 @@ struct llama_context * llama_init_from_model(
             for (auto & k : ctx->kv_self.kr_l) {
                 if (k) {
                     memory_size_k_indexer += ggml_nbytes(k);
+                    type_k_indexer = k->type;
                 }
             }
             for (auto & k : ctx->kv_self.kp_l) {
@@ -9986,7 +10096,7 @@ struct llama_context * llama_init_from_model(
             }
             if (memory_size_k_indexer > 0) {
                 LLAMA_LOG_INFO("%s: KV self indexer size = %7.2f MiB (%s)\n", __func__, memory_size_k_indexer/1024./1024.,
-                        ggml_type_name(params.idx_type_k));
+                        ggml_type_name(type_k_indexer));
             }
         }
 
