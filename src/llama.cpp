@@ -656,7 +656,7 @@ static inline uint64_t model_state_hash(const llama_context & lctx) {
     mix(lctx.dsv4.raw.write_dst_idxs.size());
     mix(lctx.dsv4.raw.read_dst_idxs.size());
     // graphs of per-step checkpointed batches keep the per-token compressor state rows (llama_dsv4_spec_ckpt_capture_rows)
-    mix(llama_dsv4_per_step_capture_active(lctx, { LLAMA_CHECKPOINT_SPEC, 0 }) ? 1 : 0);
+    mix(llama_dsv4_per_step_capture_active(lctx, { LLAMA_CHECKPOINT_SPEC, 0, 0 }) ? 1 : 0);
     //mix(lctx.dsv4.lid_plan.n_kv > lctx.model.hparams.indexer_top_k);
     //for (auto n_vis : lctx.dsv4.hca_plan.n_visible) mix(n_vis > 0);
     return h;
@@ -2334,32 +2334,32 @@ void llama_kv_cache::checkpoint_delete(llama_ckpt_data ckpt_type) {
 
 llama_kv_cache::gpu_checkpoint & llama_kv_cache::llama_get_ckpt(llama_ckpt_data ckpt_type) {
     if (ckpt_type.type == LLAMA_CHECKPOINT_REWIND) {
-        if (!ckpt_rewind_map.contains(ckpt_type.pos)) {
+        if (!ckpt_rewind_map.contains(ckpt_type.pos1)) {
             bool found = false;
             for (auto & saved_ckpt : ckpt_rewind_pool) {
                 // reuse ckpt pool
                 if (!saved_ckpt->saved && !saved_ckpt->dsv4_shadow_saved) {
-                    ckpt_rewind_map[ckpt_type.pos] = saved_ckpt.get();
+                    ckpt_rewind_map[ckpt_type.pos1] = saved_ckpt.get();
                     found = true;
                     break;
                 }
             }
             if (!found) {
                 ckpt_rewind_pool.push_back(std::make_unique<gpu_checkpoint>());
-                ckpt_rewind_map[ckpt_type.pos] = ckpt_rewind_pool.back().get();
+                ckpt_rewind_map[ckpt_type.pos1] = ckpt_rewind_pool.back().get();
             }
         }
-        return *ckpt_rewind_map[ckpt_type.pos];
+        return *ckpt_rewind_map[ckpt_type.pos1];
     }
     return ckpt;
 }
 
 bool  llama_kv_cache::llama_ckpt_mode_equal(llama_ckpt_data ckpt_type, int mode) const {
     if (ckpt_type.type == LLAMA_CHECKPOINT_REWIND) {
-        if (!ckpt_rewind_map.contains(ckpt_type.pos)) {
+        if (!ckpt_rewind_map.contains(ckpt_type.pos1)) {
             return mode==LLAMA_SPEC_CKPT_NONE;
         }
-        const auto * ckpt1 = ckpt_rewind_map.at(ckpt_type.pos);
+        const auto * ckpt1 = ckpt_rewind_map.at(ckpt_type.pos1);
         return ckpt1->selected_spec_mode== mode;
     }
     return ckpt.selected_spec_mode == mode;
@@ -7919,10 +7919,10 @@ static int llama_decode_internal(
         llama_graph_compute(lctx, gf, n_threads);
 
         if (llm_arch_is_dsv4(lctx.model.arch) &&
-            llama_dsv4_per_step_capture_active(lctx, { LLAMA_CHECKPOINT_SPEC, 0 }) &&
-            !llama_dsv4_spec_ckpt_capture_rows(&lctx, { LLAMA_CHECKPOINT_SPEC, 0 })) {
+            llama_dsv4_per_step_capture_active(lctx, { LLAMA_CHECKPOINT_SPEC, 0, 0 }) &&
+            !llama_dsv4_spec_ckpt_capture_rows(&lctx, { LLAMA_CHECKPOINT_SPEC, 0, 0 })) {
             // the checkpoint cannot be trusted: drop it, so later decodes do not keep capturing into it
-            llama_spec_ckpt_discard(&lctx, { LLAMA_CHECKPOINT_SPEC, 0 });
+            llama_spec_ckpt_discard(&lctx, { LLAMA_CHECKPOINT_SPEC, 0, 0 });
             return GGML_STATUS_FAILED;
         }
 
@@ -9748,7 +9748,7 @@ struct llama_context * llama_init_from_model(
         }
     }
 
-    if (model->arch != LLM_ARCH_GLM4_MOE && model->arch != LLM_ARCH_QWEN35 &&
+    if (model->arch != LLM_ARCH_GLM4 && model->arch != LLM_ARCH_GLM4_MOE && model->arch != LLM_ARCH_QWEN35 &&
         model->arch != LLM_ARCH_QWEN35MOE && model->arch != LLM_ARCH_GEMMA4 &&
         model->arch != LLM_ARCH_GEMMA4_MTP && model->arch != LLM_ARCH_GLM_DSA &&
         model->arch != LLM_ARCH_GLM5NEXT &&
@@ -10552,7 +10552,6 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_CHATGLM:
-        case LLM_ARCH_GLM4:
         case LLM_ARCH_GRANITE:
         case LLM_ARCH_GRANITE_MOE:
         case LLM_ARCH_COHERE2:
@@ -10567,6 +10566,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_MUSE_GLIMMER:
             return LLAMA_ROPE_TYPE_NORM;
 
+        case LLM_ARCH_GLM4:
         case LLM_ARCH_BAILINGMOE3:
             // VL files carry mrope sections; text-only files keep NORM rope
             return model->hparams.use_mrope() ? LLAMA_ROPE_TYPE_MROPE : LLAMA_ROPE_TYPE_NORM;
@@ -11278,9 +11278,9 @@ bool llama_rewind_ckpt_save(struct llama_context * ctx, llama_ckpt_data ckpt_typ
 bool llama_rewind_ckpt_discard(struct llama_context * ctx, llama_ckpt_data ckpt_type, [[maybe_unused]] llama_seq_id seq_id) {
     auto & m = ctx->kv_self.ckpt_rewind_map;
     for (auto it = m.begin(); it != m.end(); ) {
-        if (it->first < ckpt_type.pos || ckpt_type.pos <0) {
+        if ((it->first >= ckpt_type.pos1 && it->first < ckpt_type.pos2) ||(ckpt_type.pos2 < 0 && it->first >= ckpt_type.pos1)) {
             auto new_type = ckpt_type;
-            new_type.pos = it->first;
+            new_type.pos1 = it->first;
             llama_spec_ckpt_discard(ctx, new_type);
             it = m.erase(it);
         } else {
@@ -11293,7 +11293,7 @@ bool llama_rewind_ckpt_discard(struct llama_context * ctx, llama_ckpt_data ckpt_
 bool llama_rewind_ckpt_release(struct llama_context * ctx, llama_ckpt_data ckpt_type, [[maybe_unused]] llama_seq_id seq_id) {
     auto & m = ctx->kv_self.ckpt_rewind_map;
     for (auto it = m.begin(); it != m.end(); ) {
-        if (it->first < ckpt_type.pos || ckpt_type.pos < 0) {
+        if ((it->first >= ckpt_type.pos1 && it->first < ckpt_type.pos2) || (ckpt_type.pos2 < 0 && it->first >= ckpt_type.pos1)) {
             auto & ckpt = *it->second;
             ckpt.release();
             it = m.erase(it);
@@ -11303,6 +11303,21 @@ bool llama_rewind_ckpt_release(struct llama_context * ctx, llama_ckpt_data ckpt_
     }
     return true;
 }
+
+llama_pos llama_rewind_ckpt_pos(struct llama_context * ctx, llama_ckpt_data ckpt_type, [[maybe_unused]] llama_seq_id seq_id) {
+    auto & m = ctx->kv_self.ckpt_rewind_map;
+    llama_pos pos = -1;
+    for (auto it = m.begin(); it != m.end(); ) {
+        if (it->first > ckpt_type.pos1) {
+            break;
+        } else {
+            pos = it->first;
+            ++it;
+        }
+    }
+    return pos;
+}
+
 
 enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
         struct llama_context * ctx, llama_ckpt_data ckpt_type, llama_seq_id seq_id,
