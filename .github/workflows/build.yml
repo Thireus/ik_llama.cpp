@@ -23,7 +23,7 @@ env:
 
 jobs:
   macOS-latest-cmake-arm64:
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       - name: Clone
@@ -62,7 +62,7 @@ jobs:
           ctest -L 'main|curl' --verbose --timeout 900
 
   macOS-latest-cmake-x64:
-    runs-on: macos-13
+    runs-on: macos-15-intel
 
     steps:
       - name: Clone

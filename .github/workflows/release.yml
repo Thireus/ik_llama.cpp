@@ -23,7 +23,7 @@ env:
 jobs:
   macOS-arm64:
     #if: false
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       - name: Clone
@@ -1804,6 +1804,7 @@ jobs:
     # https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#modifying-the-permissions-for-the-github_token
     permissions:
         contents: write # for creating release
+        actions: read # for listing and downloading this run's artifacts
 
     runs-on: ubuntu-latest
 
@@ -1832,30 +1833,6 @@ jobs:
       - name: Determine tag name
         id: tag
         uses: ./.github/actions/get-tag-name
-
-      - name: Download artifacts
-        id: download-artifact
-        uses: actions/download-artifact@v7
-        with:
-          path: ./artifact
-          merge-multiple: true
-
-      - name: Move artifacts
-        id: move_artifacts
-        run: |
-          mkdir -p release
-
-          echo "Renaming and moving zips to release..."
-          for zip_file in artifact/llama-*.zip artifact/cudart-llama-*.zip; do
-            base_name=$(basename "$zip_file" .zip)
-            zip_name="ik_llama-${base_name/llama-/}.zip"
-            zip_name=$(echo "$zip_name" | sed -E "s/-[^-]+-b[0-9]+-[a-f0-9]{7}-bin-/-${{ steps.tag.outputs.name }}-bin-/g")
-            echo "Moving $zip_file to release/$zip_name"
-            mv "$zip_file" "release/$zip_name"
-          done
-
-          #echo "Moving any remaining artifacts..."
-          #mv -v artifact/*.zip release/ || true
 
       - name: Build static release body file
         id: build_release_body
@@ -2073,207 +2050,78 @@ jobs:
           # set the output so subsequent steps can use it
           Add-Content -Path $env:GITHUB_OUTPUT -Value "id=$($resp.id)"
 
-      - name: Upload release
+      - name: Upload release assets one at a time
         id: upload_release
-        uses: actions/github-script@v8
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const fs = require('fs');
-            const path = require('path');
-            const crypto = require('crypto');
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.name }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
 
-            const release_id = '${{ steps.create_release.outputs.id }}';
-            const dir = './release';
-            const maxAttempts = 4;
-            const backoffBaseMs = 500;
+          # The runner disk cannot hold every build artifact at once, so each artifact
+          # is downloaded, renamed, uploaded to the release and deleted before the next one.
+          gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.expired | not) | .name' | sort -u > artifact_names.txt
+          echo "Found $(wc -l < artifact_names.txt) artifact(s) in run $RUN_ID"
 
-            if (!fs.existsSync(dir)) {
-              console.log(`Directory ${dir} does not exist - nothing to upload.`);
-              return;
-            }
+          uploaded=0
+          while IFS= read -r name <&3; do
+            case "$name" in
+              llama-*.zip|cudart-llama-*.zip) ;;
+              *) echo "Skipping $name"; continue ;;
+            esac
 
-            const files = fs.readdirSync(dir).filter(f => path.extname(f).toLowerCase() === '.zip');
-            if (files.length === 0) {
-              console.log('No .zip files found to upload.');
-              return;
-            }
+            rm -rf artifact release
+            mkdir -p artifact release
+            got=0
+            for attempt in 1 2 3 4; do
+              if gh run download "$RUN_ID" -R "$REPO" -n "$name" -D ./artifact && [ -n "$(ls -A artifact)" ]; then
+                got=1
+                break
+              fi
+              echo "Download attempt $attempt failed for $name"
+              rm -rf artifact
+              mkdir -p artifact
+              sleep $((attempt * 10))
+            done
+            if [ "$got" != 1 ]; then
+              echo "::error::Download failed after 4 attempts for $name"
+              exit 1
+            fi
 
-            function normalizeRemoteDigest(raw) {
-              if (!raw) return null;
-              return raw.replace(/^sha256:/i, '').toLowerCase();
-            }
+            for zip_file in artifact/llama-*.zip artifact/cudart-llama-*.zip; do
+              [ -f "$zip_file" ] || continue
+              base_name=$(basename "$zip_file" .zip)
+              zip_name="ik_llama-${base_name/llama-/}.zip"
+              zip_name=$(echo "$zip_name" | sed -E "s/-[^-]+-b[0-9]+-[a-f0-9]{7}-bin-/-${{ steps.tag.outputs.name }}-bin-/g")
+              echo "Moving $zip_file to release/$zip_name"
+              mv "$zip_file" "release/$zip_name"
 
-            function computeLocalSha256(filePath) {
-              return new Promise((resolve, reject) => {
-                const h = crypto.createHash('sha256');
-                const s = fs.createReadStream(filePath);
-                s.on('error', reject);
-                s.on('data', chunk => h.update(chunk));
-                s.on('end', () => resolve(h.digest('hex')));
-              });
-            }
+              size=$(stat -c %s "release/$zip_name")
+              echo "=== Uploading $zip_name ($size bytes) ==="
+              df -h .
+              ok=0
+              for attempt in 1 2 3 4; do
+                if gh release upload "$TAG" "release/$zip_name" -R "$REPO" --clobber; then
+                  remote_size=$(gh release view "$TAG" -R "$REPO" --json assets \
+                    --jq ".assets[] | select(.name == \"$zip_name\") | .size") || remote_size=""
+                  if [ "$remote_size" = "$size" ]; then ok=1; break; fi
+                  echo "Size mismatch for $zip_name: local=$size remote=${remote_size:-none}"
+                fi
+                echo "Upload attempt $attempt failed for $zip_name"
+                sleep $((attempt * 10))
+              done
+              if [ "$ok" != 1 ]; then
+                echo "::error::Upload failed after 4 attempts for $zip_name"
+                exit 1
+              fi
+              uploaded=$((uploaded + 1))
+              rm -f "release/$zip_name"
+              df -h .
+            done
+          done 3< artifact_names.txt
 
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-
-            // helper: find existing asset by name (returns null if not found)
-            async function findExistingAssetByName(name) {
-              const resp = await github.rest.repos.listReleaseAssets({
-                owner,
-                repo,
-                release_id,
-                per_page: 100
-              });
-              const assets = resp.data || [];
-              return assets.find(a => a.name === name) || null;
-            }
-
-            for (const file of files) {
-              const filePath = path.join(dir, file);
-              const stat = fs.statSync(filePath);
-              const expectedSize = stat.size;
-
-              console.log(`\n=== Processing ${file} (${expectedSize} bytes) ===`);
-
-              // compute local sha (needed to validate remote digest if present)
-              const localSha = await computeLocalSha256(filePath);
-              console.log(`Local SHA256: ${localSha}`);
-
-              // check if asset already exists on the release
-              const existing = await findExistingAssetByName(file);
-              if (existing) {
-                const existingId = existing.id;
-                const remoteDigestRaw = existing.digest ?? null;
-                const remoteDigest = normalizeRemoteDigest(remoteDigestRaw);
-                const remoteSize = Number(existing.size);
-
-                console.log(`Found existing asset id=${existingId} size=${remoteSize} digest=${remoteDigestRaw ?? '<none>'}`);
-
-                if (remoteDigest) {
-                  if (remoteDigest === localSha.toLowerCase()) {
-                    console.log(`✅ Remote digest matches local for ${file} — skipping upload.`);
-                    continue; // already correct, skip to next file
-                  } else {
-                    console.warn(`❌ Remote digest present but does not match local (will delete and re-upload).`);
-                    // delete the bad asset so we can upload fresh below
-                    try {
-                      await github.rest.repos.deleteReleaseAsset({
-                        owner,
-                        repo,
-                        asset_id: existingId
-                      });
-                      console.log(`Deleted existing asset id=${existingId}`);
-                    } catch (delErr) {
-                      console.warn(`Failed to delete existing asset id=${existingId}: ${delErr && delErr.message ? delErr.message : delErr}`);
-                      // fall through to attempt upload anyway; if delete failed, upload may conflict
-                    }
-                  }
-                } else {
-                  // no digest present on remote — fall back to size check
-                  if (remoteSize === expectedSize) {
-                    console.log(`⚠️ Remote has no digest but sizes match for ${file} — skipping upload (fallback).`);
-                    continue;
-                  } else {
-                    console.warn(`❌ Remote has no digest and size mismatch (will delete and re-upload).`);
-                    try {
-                      await github.rest.repos.deleteReleaseAsset({
-                        owner,
-                        repo,
-                        asset_id: existingId
-                      });
-                      console.log(`Deleted existing asset id=${existingId}`);
-                    } catch (delErr) {
-                      console.warn(`Failed to delete existing asset id=${existingId}: ${delErr && delErr.message ? delErr.message : delErr}`);
-                    }
-                  }
-                }
-              } // end existing asset handling
-
-              // Upload loop (with retries) — only executed if we need to upload
-              let attempt = 0;
-              let success = false;
-              while (attempt < maxAttempts && !success) {
-                attempt++;
-                console.log(`Upload attempt ${attempt} for ${file}...`);
-                const stream = fs.createReadStream(filePath);
-                try {
-                  const resp = await github.rest.repos.uploadReleaseAsset({
-                    owner,
-                    repo,
-                    release_id,
-                    name: file,
-                    data: stream,
-                    headers: {
-                      'content-type': 'application/zip',
-                      'content-length': expectedSize
-                    }
-                  });
-
-                  const uploadedSize = Number(resp.data.size);
-                  const assetId = resp.data.id;
-                  const remoteDigestRaw = resp.data.digest ?? null;
-                  const remoteDigest = normalizeRemoteDigest(remoteDigestRaw);
-
-                  console.log(`Uploaded asset id=${assetId} size=${uploadedSize} digest=${remoteDigestRaw ?? '<none>'}`);
-
-                  // validate
-                  if (remoteDigest) {
-                    if (remoteDigest === localSha.toLowerCase()) {
-                      console.log(`✅ Digest match after upload for ${file}`);
-                      success = true;
-                    } else {
-                      console.warn(`❌ Digest mismatch after upload for ${file}: local=${localSha} remote=${remoteDigestRaw}`);
-                    }
-                  } else {
-                    if (uploadedSize === expectedSize) {
-                      console.log(`⚠️ Digest unavailable, but size matches after upload for ${file} — accepting (fallback).`);
-                      success = true;
-                    } else {
-                      console.warn(`❌ Size mismatch after upload for ${file}: expected=${expectedSize} uploaded=${uploadedSize}`);
-                    }
-                  }
-
-                  // if verification failed, delete the uploaded asset so retries don't accumulate bad assets
-                  if (!success) {
-                    try {
-                      console.log(`Deleting asset id=${assetId} (verification failed) ...`);
-                      await github.rest.repos.deleteReleaseAsset({
-                        owner,
-                        repo,
-                        asset_id: assetId
-                      });
-                      console.log(`Deleted asset id=${assetId}`);
-                    } catch (delErr) {
-                      console.warn(`Failed deleting bad uploaded asset id=${assetId}: ${delErr && delErr.message ? delErr.message : delErr}`);
-                    }
-
-                    if (attempt < maxAttempts) {
-                      const wait = Math.pow(2, attempt) * backoffBaseMs;
-                      console.log(`Will retry in ${wait}ms...`);
-                      await new Promise(r => setTimeout(r, wait));
-                    } else {
-                      throw new Error(`Failed verification after ${maxAttempts} attempts for ${file}`);
-                    }
-                  }
-
-                } catch (err) {
-                  console.warn(`Attempt ${attempt} error for ${file}: ${err && err.message ? err.message : String(err)}`);
-                  if (attempt < maxAttempts) {
-                    const wait = Math.pow(2, attempt) * backoffBaseMs;
-                    console.log(`Retrying in ${wait}ms...`);
-                    await new Promise(r => setTimeout(r, wait));
-                  } else {
-                    throw new Error(`Upload failed after ${maxAttempts} attempts for ${file}: ${err && err.message ? err.message : String(err)}`);
-                  }
-                } finally {
-                  try { stream.destroy(); } catch (e) { /* ignore */ }
-                }
-              } // end upload attempts
-
-              if (!success) {
-                throw new Error(`Giving up on ${file} after ${maxAttempts} attempts.`);
-              }
-            } // end files loop
-
-            console.log('All uploads processed.');
+          rm -rf artifact release
+          echo "Uploaded $uploaded asset(s) to release $TAG"
