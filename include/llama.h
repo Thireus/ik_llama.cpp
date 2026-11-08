@@ -192,6 +192,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q4_0_4_8      = 34, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q4_0_8_8      = 35, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_MXFP4         = 38, // except 1d tensors, 38 to be compatible with mainline
+        LLAMA_FTYPE_MOSTLY_NVFP4         = 39,
         LLAMA_FTYPE_MOSTLY_Q1_0_G128     = 41, // except 1d tensors, 38 to be compatible with mainline
         //
         LLAMA_FTYPE_MOSTLY_Q6_0          = 135, // except 1d tensors
@@ -226,6 +227,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_TQP5          = 166, // except 1d tensors (trellis, group-128)
         LLAMA_FTYPE_MOSTLY_TQP6          = 167, // except 1d tensors (trellis, group-128)
         LLAMA_FTYPE_MOSTLY_TQP7          = 168, // except 1d tensors (trellis, group-128)
+        LLAMA_FTYPE_MOSTLY_NVFP4_KS      = 169,
         LLAMA_FTYPE_MOSTLY_Q4_0_R8       = 202, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q8_0_R8       = 207, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q5_0_R4       = 208, // except 1d tensors
@@ -446,6 +448,9 @@ extern "C" {
 
         const struct llama_model_tensor_buft_override * tensor_buft_overrides;
 
+        // separate GGUF with the n-gram tables (per-layer token embedding, Engram), NULL if none
+        const char * ngram_file;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;    // only load the vocabulary, no weights
         bool use_mmap;      // use mmap if possible
@@ -463,6 +468,11 @@ extern "C" {
         bool defer_experts;    // defer expert mmap residency to speed up model loading (Linux only)
         bool defer_ple;        // keep sparse tables (PLE, engram) on the file instead of resident in memory (Linux and Windows only)
         bool swa_compress;     // must match llama_context_params::swa_compress; the fit also assumes that context's n_ubatch
+    };
+
+    enum llama_moe_cache_policy {
+        LLAMA_MOE_CACHE_POLICY_LRU = 0,
+        LLAMA_MOE_CACHE_POLICY_CLASSLRU = 1,
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
@@ -498,6 +508,7 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
         size_t moe_cache_size; // total device-cache budget for host-resident MoE experts, split across GPUs [EXPERIMENTAL]
+        enum llama_moe_cache_policy moe_cache_policy; // replacement policy for the MoE cache
         enum ggml_type idx_type_k; // data type for indexer K cache [EXPERIMENTAL]
         enum ggml_type type_reduce; // data type for reduce operations
         enum ggml_type type_graph_attn; // flash-attn precision under -sm graph

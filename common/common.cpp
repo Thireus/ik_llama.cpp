@@ -2425,6 +2425,18 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.moe_cache_size = (size_t) mib * 1024 * 1024;
         return true;
     }
+    if (arg == "--moe-cache-policy") {
+        CHECK_ARG
+        if (std::strcmp(argv[i], "lru") == 0) {
+            params.moe_cache_policy = LLAMA_MOE_CACHE_POLICY_LRU;
+        } else if (std::strcmp(argv[i], "classlru") == 0) {
+            params.moe_cache_policy = LLAMA_MOE_CACHE_POLICY_CLASSLRU;
+        } else {
+            fprintf(stderr, "error: Invalid value for --moe-cache-policy: %s (expected lru or classlru)\n", argv[i]);
+            invalid_param = true;
+        }
+        return true;
+    }
     if (arg == "--fit") {
         params.fit = true;
         return true;
@@ -2436,6 +2448,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     }
     if (arg == "-dple" || arg == "--defer-ple") {
         params.defer_ple = true;
+        return true;
+    }
+    if (arg == "--ngram-file" || arg == "--ple-file") {
+        CHECK_ARG
+        params.ngram_file = argv[i];
         return true;
     }
     if (arg == "--cpu-mask" || arg == "-cm") {
@@ -3610,9 +3627,11 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-cmoe,  --cpu-moe",              "keep all MoE weights in CPU memory"});
     options.push_back({ "*",           "-ncmoe, --n-cpu-moe N",          "keep MoE weights of the first N layers in CPU memory"});
     options.push_back({ "*",           "       --moe-cache-mib N",       "Total GPU cache budget in MiB for CPU-resident MoE experts, split across GPUs (default: 0, disabled)"});
+    options.push_back({ "*",           "       --moe-cache-policy NAME", "MoE cache replacement policy: lru (default) or classlru"});
     options.push_back({ "*",           "-thp,   --transparent-huge-pages", "use transparent huge pages on Linux"});
     options.push_back({ "*",           "-dexp,  --defer-experts",        "defer expert mmap residency on Linux to reduce model load time"});
     options.push_back({ "*",           "-dple,  --defer-ple",            "keep sparse tables (PLE, engram) on the file instead of resident in memory (Linux, Windows)"});
+    options.push_back({ "*",           "       --ngram-file FNAME",      "load the n-gram tables (PLE, engram) from a separate GGUF (alias: --ple-file)"});
     options.push_back({ "*",           "-prexp, --prefetch-experts",     "stream mmap'd MoE expert weights into the page cache on Linux"});
     options.push_back({ "*",           "-prexp-t, --prefetch-experts-threads N",
                                                                         "number of expert prefetch workers, tune to drive speed/type (default: auto)"});
@@ -4670,6 +4689,7 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     mparams.flash_attn      = params.flash_attn;
     mparams.defer_experts   = params.defer_experts;
     mparams.defer_ple       = params.defer_ple;
+    mparams.ngram_file      = params.ngram_file.empty() ? nullptr : params.ngram_file.c_str();
     mparams.swa_compress    = params.swa_compress;
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
@@ -4729,6 +4749,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
 
     cparams.n_ctx             = params.n_ctx;
     cparams.moe_cache_size    = params.moe_cache_size;
+    cparams.moe_cache_policy  = params.moe_cache_policy;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_batch           = n_batch;
     cparams.n_ubatch          = n_ubatch;
@@ -5820,6 +5841,7 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "merge_up_gate_exps: %s # default: false\n", params.merge_up_gate_exps ? "true" : "false");
     fprintf(stream, "defer_experts: %s # default: false\n", params.defer_experts ? "true" : "false");
     fprintf(stream, "defer_ple: %s # default: false\n", params.defer_ple ? "true" : "false");
+    fprintf(stream, "ngram_file: %s # default:\n", params.ngram_file.c_str());
     fprintf(stream, "prefetch_experts: %s # default: false\n", params.prefetch_experts ? "true" : "false");
     fprintf(stream, "prefetch_experts_threads: %d # default: 0 (auto)\n", params.prefetch_experts_threads);
     fprintf(stream, "max_extra_alloc: %d # default: 256\n", params.max_extra_alloc_MiB);

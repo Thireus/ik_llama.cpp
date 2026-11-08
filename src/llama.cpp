@@ -25,6 +25,7 @@
 #include "llama-hparams.h"
 #include "llama-context.h"
 #include "llama-moe-cache.h"
+#include "llama-moe-cache-policy.h"
 #include "llama-spec-features.h"
 #include "llama-dflash.h"
 #include "llama-dsv4.h"
@@ -5695,7 +5696,8 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
         llama_model_loader ml(fname, params.ncmoe, params.use_mmap, params.check_tensors,
                 params.repack_tensors, params.use_thp, params.merge_qkv, params.merge_up_gate_exps,
                 params.defer_experts,
-                params.kv_overrides, params.tensor_buft_overrides);
+                params.kv_overrides, params.tensor_buft_overrides,
+                params.ngram_file ? params.ngram_file : "");
 
         model.hparams.vocab_only = params.vocab_only;
 
@@ -8915,10 +8917,6 @@ int32_t llama_lora_adapter_set(
             struct llama_context * ctx,
             struct llama_lora_adapter * adapter,
             float scale) {
-    if (ctx->cparams.flash_attn) {
-        LLAMA_LOG_ERROR("%s: flash_attn is not compatible with LoRA\n", __func__);
-        return -1;
-    }
     ctx->lora_adapters[adapter] = scale;
     return 0;
 }
@@ -8980,6 +8978,7 @@ struct llama_model_params llama_model_default_params() {
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_buft_overrides       =*/ nullptr,
+        /*.ngram_file                  =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_mlock                   =*/ false,
@@ -9033,6 +9032,7 @@ struct llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.moe_cache_policy            =*/ LLAMA_MOE_CACHE_POLICY_LRU,
         /*.idx_type_k                  =*/ GGML_TYPE_F16,
         /*.type_reduce                 =*/ GGML_TYPE_F16,
         /*.type_graph_attn             =*/ GGML_TYPE_F16,
@@ -9416,6 +9416,11 @@ struct llama_context * llama_init_from_model(
                  struct llama_model * model,
         struct llama_context_params   params) {
 
+    if (!llama_moe_cache_policy_detail::valid(params.moe_cache_policy)) {
+        LLAMA_LOG_ERROR("%s: invalid MoE cache policy value %d\n", __func__, (int) params.moe_cache_policy);
+        return nullptr;
+    }
+
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
         return nullptr;
@@ -9633,6 +9638,7 @@ struct llama_context * llama_init_from_model(
     cparams.cuda_params      = params.cuda_params;
     cparams.mtp              = params.mtp;
     cparams.moe_cache_size   = params.moe_cache_size;
+    cparams.moe_cache_policy = params.moe_cache_policy;
     cparams.worst_graph_tokens = params.worst_case_tokens;
     cparams.dflash_query_capacity = params.dflash_query_capacity;
 
@@ -10172,7 +10178,7 @@ struct llama_context * llama_init_from_model(
             if (cparams.moe_cache_size > 0) {
                 try {
                     ctx->moe_cache = std::make_unique<llama_moe_cache>(*model, ctx->backends, backend_buft,
-                            cparams.moe_cache_size);
+                            cparams.moe_cache_size, cparams.moe_cache_policy);
                     ggml_backend_sched_set_copy_callback(ctx->sched, llama_context::sched_copy_moe_cache, ctx);
                 } catch (const std::exception & e) {
                     LLAMA_LOG_ERROR("%s: failed to initialize MoE cache: %s\n", __func__, e.what());
