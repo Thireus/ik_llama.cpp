@@ -1,0 +1,198 @@
+name: Sync upstream and release
+
+# Daily: merge ikawrakow/ik_llama.cpp main into this fork's main, push it, then
+# dispatch the Release workflow on main with create_release=true unless a Release
+# run is still queued or running. Failed Release runs are re-run by
+# release-retry.yml.
+#
+# 03:30 UTC: upstream commits land between about 04:00 and 19:00 UTC, so the
+# sync picks up the whole previous day before new work starts, the long Windows
+# CUDA builds finish during the European morning, and the time stays clear of
+# the top of the hour, when GitHub delays scheduled runs the most.
+#
+# A push made with GITHUB_TOKEN does not trigger push workflows, which is why the
+# Release build is dispatched explicitly (workflow_dispatch is exempt from that
+# rule).
+
+on:
+  schedule:
+    - cron: '30 3 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: merge locally and print every action, push and dispatch nothing'
+        required: false
+        type: boolean
+        default: false
+      force_release:
+        description: 'Dispatch a Release build even when upstream has nothing new'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push main
+  issues: write   # report a merge conflict
+  actions: write  # dispatch release.yml
+
+env:
+  UPSTREAM_URL: https://github.com/ikawrakow/ik_llama.cpp.git
+  UPSTREAM_BRANCH: main
+  TARGET_BRANCH: main
+  RELEASE_WORKFLOW: release.yml
+  GIT_NAME: "Thireus ☠"
+  GIT_EMAIL: Thireus@users.noreply.github.com
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+  FORCE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.force_release && 'true' || 'false' }}
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        id: check
+        run: |
+          set -euo pipefail
+          echo "dry_run=$DRY_RUN force_release=$FORCE_RELEASE"
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          up_sha=$(git rev-parse "upstream/$UPSTREAM_BRANCH")
+          main_sha=$(git rev-parse HEAD)
+          count=$(git rev-list --count "HEAD..upstream/$UPSTREAM_BRANCH")
+          echo "main $main_sha, upstream $up_sha, $count upstream commit(s) not in main"
+          {
+            echo "up_sha=$up_sha"
+            echo "up_short=$(git rev-parse --short=10 "$up_sha")"
+            echo "count=$count"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$count" -eq 0 ]; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+            if [ "$FORCE_RELEASE" = true ]; then
+              echo "Nothing new upstream; force_release is set, going on to the release dispatch"
+            else
+              echo "Nothing new upstream: main already contains upstream $up_sha"
+            fi
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream
+        id: merge
+        if: steps.check.outputs.new == 'true'
+        env:
+          UP_SHA: ${{ steps.check.outputs.up_sha }}
+          UP_SHORT: ${{ steps.check.outputs.up_short }}
+          COUNT: ${{ steps.check.outputs.count }}
+        run: |
+          set -euo pipefail
+          git config user.name "$GIT_NAME"
+          git config user.email "$GIT_EMAIL"
+          main_before=$(git rev-parse HEAD)
+          tmp=${RUNNER_TEMP:-/tmp}
+
+          report() { # report TITLE_PREFIX MESSAGE FILES_FILE: one open issue per kind, updated each day
+            local prefix=$1 msg=$2 files=$3 title body num
+            title="$prefix $(date -u +%F)"
+            body=$(printf '%s\n\nUpstream: %s\nMain: %s\nRun: %s\n\nFiles:\n%s\n' "$msg" "$UP_SHA" "$main_before" \
+              "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" "$(sed 's/^/- /' "$files")")
+            echo "::error::$msg"
+            { echo "### $title"; echo; echo "$body"; } >> "$GITHUB_STEP_SUMMARY"
+            if [ "$DRY_RUN" = true ]; then
+              echo "[dry-run] would open or update the issue \"$title\""
+              return 0
+            fi
+            num=$(gh issue list --state open --search "\"$prefix\" in:title" --json number,title \
+              --jq "[.[] | select(.title | startswith(\"$prefix\"))][0].number // empty" 2>/dev/null) || num=""
+            if [ -n "$num" ]; then
+              gh issue edit "$num" --title "$title" --body "$body" && gh issue comment "$num" --body "Still failing on $(date -u +%F): $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+                && echo "Updated issue #$num" || echo "::warning::could not update issue #$num (are issues enabled on this repository?)"
+            else
+              gh issue create --title "$title" --body "$body" \
+                || echo "::warning::could not open an issue (are issues enabled on this repository?)"
+            fi
+          }
+
+          subject="Merge upstream main $UP_SHORT into main"
+          body="Brings in $COUNT commit(s) from ikawrakow/ik_llama.cpp main up to $UP_SHA."
+          echo "Merging: $subject"
+          if ! git merge --no-ff --no-edit -m "$subject" -m "$body" "upstream/$UPSTREAM_BRANCH"; then
+            git diff --name-only --diff-filter=U | sort -u > "$tmp/conflicts.txt"
+            echo "Conflicting files:"; cat "$tmp/conflicts.txt"
+            git merge --abort
+            report "upstream sync conflict" "Merging upstream main into main conflicts; main was left unchanged. Merge it by hand, then the daily sync resumes on its own." "$tmp/conflicts.txt"
+            exit 1
+          fi
+          git log -1 --format='Merge commit %H%n%n%B'
+
+          # GITHUB_TOKEN has no workflows permission: GitHub refuses a push that changes workflow files.
+          git diff --name-only HEAD^1 HEAD -- .github/workflows > "$tmp/workflow_changes.txt"
+          if [ -s "$tmp/workflow_changes.txt" ]; then
+            echo "Upstream changes workflow files:"; cat "$tmp/workflow_changes.txt"
+            report "upstream sync blocked" "Upstream changes files under .github/workflows, which GITHUB_TOKEN may not push; main was left unchanged. Merge it by hand, then the daily sync resumes on its own." "$tmp/workflow_changes.txt"
+            exit 1
+          fi
+
+      - name: Push main
+        if: steps.check.outputs.new == 'true'
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = true ]; then
+            echo "[dry-run] would run: git push origin HEAD:$TARGET_BRANCH ($(git rev-parse HEAD))"
+            exit 0
+          fi
+          git push origin "HEAD:$TARGET_BRANCH"
+          echo "Pushed $(git rev-parse HEAD) to $TARGET_BRANCH"
+
+      - name: Dispatch Release
+        if: steps.check.outputs.new == 'true' || env.FORCE_RELEASE == 'true'
+        run: |
+          set -euo pipefail
+          active=""
+          for s in queued in_progress waiting pending requested; do
+            ids=$(gh run list --workflow "$RELEASE_WORKFLOW" --status "$s" --limit 20 --json databaseId --jq '.[].databaseId')
+            [ -n "$ids" ] && active="$active $ids"
+          done
+          if [ -n "${active// /}" ]; then
+            echo "A release build is still running: not dispatching (run(s):$active)"
+            exit 0
+          fi
+
+          # Same tag rule as .github/actions/get-tag-name for a non-master branch.
+          tag="$(echo "$TARGET_BRANCH" | tr '/' '-')-b$(git rev-list --count HEAD)-$(git rev-parse --short=7 HEAD)"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::warning::release $tag already exists for this commit: not dispatching"
+            exit 0
+          fi
+
+          if [ "$DRY_RUN" = true ]; then
+            echo "[dry-run] would run: gh workflow run $RELEASE_WORKFLOW --ref $TARGET_BRANCH -f create_release=true (expected tag $tag)"
+            exit 0
+          fi
+          since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          gh workflow run "$RELEASE_WORKFLOW" --ref "$TARGET_BRANCH" -f create_release=true
+          echo "Dispatched $RELEASE_WORKFLOW on $TARGET_BRANCH (expected tag $tag)"
+          for _ in $(seq 1 12); do
+            sleep 10
+            url=$(gh run list --workflow "$RELEASE_WORKFLOW" --branch "$TARGET_BRANCH" --event workflow_dispatch --limit 5 \
+              --json url,createdAt --jq "[.[] | select(.createdAt >= \"$since\")][0].url // empty")
+            if [ -n "$url" ]; then
+              echo "Release run: $url"
+              echo "Release run: $url" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          done
+          echo "::warning::the dispatched run did not show up within 2 minutes; see the Actions tab"
