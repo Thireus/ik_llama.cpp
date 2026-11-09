@@ -5951,6 +5951,8 @@ static struct ggml_tensor * ggml_new_tensor_impl(
     GGML_ASSERT(type >= 0 && type < GGML_TYPE_COUNT);
     GGML_ASSERT(n_dims >= 1 && n_dims <= GGML_MAX_DIMS);
 
+    const float input_scale = type == GGML_TYPE_NVFP4_KS && view_src ? ggml_get_input_scale(view_src) : 0.0f;
+
     // find the base tensor and absolute offset
     if (view_src != NULL && view_src->view_src != NULL) {
         view_offs += view_src->view_offs;
@@ -6024,6 +6026,10 @@ static struct ggml_tensor * ggml_new_tensor_impl(
 #ifdef __clang__
     #pragma clang diagnostic pop
 #endif
+
+    if (type == GGML_TYPE_NVFP4_KS && view_src) {
+        ggml_set_input_scale(result, input_scale);
+    }
 
     // TODO: this should not be needed as long as we don't rely on aligned SIMD loads
     //GGML_ASSERT_ALIGNED(result->data);
@@ -6112,8 +6118,22 @@ struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value) {
     return result;
 }
 
+void ggml_set_input_scale(struct ggml_tensor * tensor, float scale) {
+    memcpy(tensor->op_params + GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1, &scale, sizeof(scale));
+}
+
+float ggml_get_input_scale(const struct ggml_tensor * tensor) {
+    float scale;
+    memcpy(&scale, tensor->op_params + GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1, sizeof(scale));
+    return scale;
+}
+
 struct ggml_tensor * ggml_dup_tensor(struct ggml_context * ctx, const struct ggml_tensor * src) {
-    return ggml_new_tensor(ctx, src->type, GGML_MAX_DIMS, src->ne);
+    struct ggml_tensor * result = ggml_new_tensor(ctx, src->type, GGML_MAX_DIMS, src->ne);
+    if (src->type == GGML_TYPE_NVFP4_KS) {
+        ggml_set_input_scale(result, ggml_get_input_scale(src));
+    }
+    return result;
 }
 
 static void ggml_set_op_params(struct ggml_tensor * tensor, const void * params, size_t params_size) {
@@ -30030,10 +30050,9 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                 {
                     cur = 0;
                     const struct ggml_tensor * src0 = node->src[0];
-                    const struct ggml_tensor * src1 = node->src[1];
                     const struct ggml_tensor * src2 = node->src[2];
                     const enum ggml_type vec_dot_type = type_traits[src0->type].vec_dot_type;
-                    if (src1 && src1->type != vec_dot_type) {
+                    if (src2->type != vec_dot_type) {
                         cur += ggml_row_size(vec_dot_type, src2->ne[0]) * ggml_nrows(src2);
                     }
                     const int n_as = src0->ne[2];
@@ -30048,7 +30067,7 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                     const struct ggml_tensor * src2 = node->src[2];
                     const enum ggml_type vec_dot_type = type_traits[src0->type].vec_dot_type;
                     if (src2->type != vec_dot_type) {
-                        cur += ggml_row_size(vec_dot_type, node->src[1]->ne[0]) * ggml_nrows(node->src[1]);
+                        cur += ggml_row_size(vec_dot_type, src2->ne[0]) * ggml_nrows(src2);
                     }
                 } break;
             case GGML_OP_OUT_PROD:
