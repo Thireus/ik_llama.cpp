@@ -1,0 +1,92 @@
+name: Release retry
+
+# Re-runs the failed jobs of a failed Release run on main, at most MAX_RERUNS
+# times (attempts 2 to MAX_RERUNS + 1).
+#
+# "Re-run failed jobs" re-runs the failed and cancelled jobs together with every
+# job that depends on them, so the release job (skipped when one of its needs
+# failed) runs again once all its needs succeed. The jobs that already passed
+# keep their artifacts in the same run, which the release job collects.
+#
+# When re-run attempt N completes it fires workflow_run again, which is how the
+# chain continues up to the cap. GitHub limits workflow_run chains to three
+# levels and does not document whether a run re-run by GITHUB_TOKEN fires
+# workflow_run, so the hourly schedule checks the latest Release run as a
+# safety net; both paths read the run's current state first, so one failure is
+# re-run once.
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+    branches: [main]
+  schedule:
+    - cron: '47 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: release-retry
+  cancel-in-progress: false
+
+permissions:
+  actions: write # re-run jobs
+
+env:
+  MAX_RERUNS: 3
+  RELEASE_WORKFLOW: release.yml
+  RELEASE_BRANCH: main
+  MAX_AGE_HOURS: 48 # the schedule path leaves older runs alone
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Re-run failed jobs
+        env:
+          EVENT_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          if [ -n "$EVENT_RUN_ID" ]; then
+            run_id=$EVENT_RUN_ID
+            echo "Triggered by the completion of Release run $run_id"
+          else
+            run_id=$(gh run list --workflow "$RELEASE_WORKFLOW" --branch "$RELEASE_BRANCH" --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+            if [ -z "$run_id" ]; then
+              echo "No Release run on $RELEASE_BRANCH: nothing to do"
+              exit 0
+            fi
+            echo "Checking the latest Release run on $RELEASE_BRANCH: $run_id"
+          fi
+
+          # Current state, not the event payload: the other path may have re-run it already.
+          read -r status conclusion attempt created url < <(gh api "repos/$GH_REPO/actions/runs/$run_id" \
+            --jq '[.status, (.conclusion // "none"), .run_attempt, .created_at, .html_url] | @tsv')
+          echo "Run $url: status $status, conclusion $conclusion, attempt $attempt, created $created"
+
+          if [ "$status" != completed ]; then
+            echo "Not re-running: the run is $status"
+            exit 0
+          fi
+          if [ "$conclusion" != failure ]; then
+            echo "Not re-running: the run concluded $conclusion"
+            exit 0
+          fi
+          if [ "$attempt" -ge $((MAX_RERUNS + 1)) ]; then
+            echo "::warning::Not re-running: attempts exhausted ($attempt attempts, at most $MAX_RERUNS re-runs) for $url"
+            exit 0
+          fi
+          if [ -z "$EVENT_RUN_ID" ]; then
+            age_h=$(( ( $(date -u +%s) - $(date -u -d "$created" +%s) ) / 3600 ))
+            if [ "$age_h" -ge "$MAX_AGE_HOURS" ]; then
+              echo "Not re-running: the run is ${age_h}h old (limit ${MAX_AGE_HOURS}h)"
+              exit 0
+            fi
+          fi
+
+          echo "Re-running the failed jobs of $url: attempt $((attempt + 1)) (re-run $attempt of $MAX_RERUNS)"
+          gh run rerun "$run_id" --failed
+          echo "Re-run $attempt of $MAX_RERUNS requested for $url" >> "$GITHUB_STEP_SUMMARY"
