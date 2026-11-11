@@ -2751,7 +2751,7 @@ static __global__ void k_simple_gemm_T(int n, int nx, const src_t * x, const flo
     int warp_id = threadIdx.x / WARP_SIZE;
     if (lane_id == 0) tmp[warp_id] = sum;
     __syncthreads();
-    sum = tmp[lane_id];
+    sum = lane_id < blockDim.x/WARP_SIZE ? tmp[lane_id] : 0.0f;
     sum = warp_reduce_sum(sum);
     if (threadIdx.x == 0) {
         z[iy*nx + ix] = sum;
@@ -2765,18 +2765,20 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
          src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
          src0->ne[0] >= 1024 && src0->ne[2]*src0->ne[3] == 1 && src1->ne[2]*src1->ne[3] == 1 && src1->ne[1] <= 8) {
         auto nsm = ggml_cuda_info().devices[ctx.device].nsm;
-        if (src0->ne[1] * src1->ne[1] <= nsm) {
+        bool few_rows = src0->ne[1] * src1->ne[1] <= nsm;
+        if (few_rows || (src1->ne[1] == 1 && src0->type != GGML_TYPE_F32 && !(src0->buffer && ggml_backend_buft_is_cuda_split(src0->buffer->buft)))) {
+            int nth = few_rows ? 1024 : 256;
             dim3 grid(src0->ne[1], src1->ne[1], 1);
             if (src0->type == GGML_TYPE_F32) {
-                k_simple_gemm_T<<<grid, 1024, 0, ctx.stream()>>>(src0->ne[0], src0->ne[1], (const float *)src0->data,
+                k_simple_gemm_T<<<grid, nth, 0, ctx.stream()>>>(src0->ne[0], src0->ne[1], (const float *)src0->data,
                         (const float *)src1->data, (float *)dst->data, src0->nb[1]/sizeof(float), src1->nb[1]/sizeof(float));
             }
             else if (src0->type == GGML_TYPE_F16) {
-                k_simple_gemm_T<<<grid, 1024, 0, ctx.stream()>>>(src0->ne[0], src0->ne[1], (const half *)src0->data,
+                k_simple_gemm_T<<<grid, nth, 0, ctx.stream()>>>(src0->ne[0], src0->ne[1], (const half *)src0->data,
                         (const float *)src1->data, (float *)dst->data, src0->nb[1]/sizeof(half), src1->nb[1]/sizeof(float));
             }
             else {
-                k_simple_gemm_T<<<grid, 1024, 0, ctx.stream()>>>(src0->ne[0], src0->ne[1], (const nv_bfloat16 *)src0->data,
+                k_simple_gemm_T<<<grid, nth, 0, ctx.stream()>>>(src0->ne[0], src0->ne[1], (const nv_bfloat16 *)src0->data,
                         (const float *)src1->data, (float *)dst->data, src0->nb[1]/sizeof(nv_bfloat16), src1->nb[1]/sizeof(float));
             }
             return node_n;
@@ -5490,7 +5492,13 @@ GGML_CALL static bool ggml_backend_cuda_offload_op(ggml_backend_t backend, const
         return should_offload;
     }
 
-    return op->ne[1] >= min_batch_size && op->op != GGML_OP_GET_ROWS;
+    int64_t batch_size = op->ne[1];
+    if (op->op == GGML_OP_SSM_CONV) {
+        batch_size = op->src[1]->ne[1];
+    } else if (op->op != GGML_OP_MUL_MAT) {
+        batch_size = op->ne[3] > 1 ? op->ne[3] : op->ne[2] > 1 ? op->ne[2] : op->ne[1];
+    }
+    return batch_size >= min_batch_size && op->op != GGML_OP_GET_ROWS;
 
     // Original:
     //return (op->ne[1] >= min_batch_size && op->op != GGML_OP_GET_ROWS) ||
