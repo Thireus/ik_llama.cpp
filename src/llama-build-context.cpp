@@ -652,8 +652,9 @@ ggml_tensor * llm_build_context::build_swa_mask_for_graph(uint32_t window, bool 
         return nullptr;
     }
 
-    // non-causal image decode: full mask, not the causal-only windowed view
-    if (!cparams.causal_attn) {
+    // non-causal image decode: full mask, unless the arch handles the non-causal
+    // span inside the window view (swa_full_non_causal, e.g. DSV4 vision)
+    if (!cparams.causal_attn && !hparams.swa_full_non_causal) {
         return build_inp_KQ_mask_swa();
     }
 
@@ -3779,6 +3780,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
         case LLM_ARCH_SEED_OSS:
             {
                 result = llm.build_seedoss();
+            } break;
+        case LLM_ARCH_STEP5:
+            {
+                result = llm.build_step5();
             } break;
         case LLM_ARCH_STEP35:
             {
