@@ -47,10 +47,10 @@
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
 
 #define LLAMA_SESSION_MAGIC   LLAMA_FILE_MAGIC_GGSN
-#define LLAMA_SESSION_VERSION 10
+#define LLAMA_SESSION_VERSION 11 // 11: the whole-context blob gained the Mamba-2 conv-state block
 
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
-#define LLAMA_STATE_SEQ_VERSION 4
+#define LLAMA_STATE_SEQ_VERSION 5 // 5: standard Mamba-2 conv state block
 
 #define LLAMA_SERVER_MAGIC 0x6c6d7376u // 'lmsv'
 #define LLAMA_SERVER_VERSION 1
@@ -554,6 +554,7 @@ extern "C" {
         bool dsa;               // enable GLM DSA sparse attention (off by default) [EXPERIMENTAL]
         bool fused_idx_topk;    // enable the fused indexer topk op (on by default) [EXPERIMENTAL]
         bool swa_compress;      // allocate sliding-window layers at window size instead of n_ctx (off by default) [EXPERIMENTAL]
+        bool force_experts_offload_device; // If true, force experts left in RAM to be offloaded to the default GPU for this layer
         int  dsv41_replay_keep; // DeepSeek-V4.1 prefill: run the decoder layers on the last N prompt tokens only, N=0 disables (requires swa_compress) [EXPERIMENTAL]
         bool dsv4_legacy_state; // write DeepSeek-V4 state in the legacy full-slice layout (no MAGIC), byte-identical to main [EXPERIMENTAL]
         int  dsa_top_k;         // DSA top-k override (<0 => model's configured indexer_top_k) [EXPERIMENTAL]
