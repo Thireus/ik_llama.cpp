@@ -4275,6 +4275,74 @@ static inline bool ops_are_same_device(const ggml_cgraph * cgraph, int first, in
     return true;
 }
 
+static __global__ void k_softmax_gemm_f32(int ne00, int ne01, int ne11, int nelem,
+        size_t nb01, size_t nb02, size_t nb11, size_t nb12,
+        const float * __restrict__ x0, const float * __restrict__ x1, float * __restrict__ y, float scale) {
+
+    int ir = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ir >= nelem) {
+        return;
+    }
+    int i2 = ir/(ne01*ne11);
+    int i11 = (ir - i2*ne01*ne11)/ne01;
+    int i01 = ir - i2*ne01*ne11 - i11*ne01;
+
+    x0 += i01*nb01 + i2*nb02;
+    x1 += i11*nb11 + i2*nb12;
+    y  += i11*ne01 + i2*ne01*ne11;
+
+    float max = fmaxf(x1[0], x1[1]);
+    for (int j = 2; j < ne00; ++j) max = fmaxf(max, x1[j]);
+    float sum_n = 0, sum_d = 0;
+    for (int j = 0; j < ne00; ++j) {
+        float p = expf(scale*(x1[j] - max));
+        sum_n += p*x0[j];
+        sum_d += p;
+    }
+    y[i01] = sum_n / sum_d;
+}
+
+static bool ggml_cuda_op_fused_softmax_small_gemm_f32(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst)) return false;
+    auto src0 = dst->src[0];
+    auto src1 = dst->src[1];
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) return false;
+    if (src1->op != GGML_OP_SOFT_MAX) return false;
+    if (src0->ne[0] != src1->ne[0] || src0->ne[2] != src1->ne[2] || src0->ne[3] != 1 || src1->ne[3] != 1) return false;
+    if (src1->src[1] != NULL) return false;
+    if (src0->ne[0] >= 16) return false;
+
+    const float * fparams = (const float *)src1->op_params;
+    float scale = fparams[0];
+    float bias  = fparams[1];
+    if (bias != 0.0f) return false;
+
+    int nr = src0->ne[2] * src0->ne[1] * src1->ne[1];
+    int nsm = ggml_cuda_info().devices[ctx.device].nsm;
+    if (nsm*WARP_SIZE >= nr) {
+        int nblock = (nr + WARP_SIZE - 1)/WARP_SIZE;
+        k_softmax_gemm_f32<<<nblock, WARP_SIZE, 0, ctx.stream()>>>(src0->ne[0], src0->ne[1], src1->ne[1], ggml_nelements(dst),
+                src0->nb[1]/sizeof(float), src0->nb[2]/sizeof(float),
+                src1->nb[1]/sizeof(float), src1->nb[2]/sizeof(float),
+                (const float *)src0->data, (const float *)src1->data, (float *)dst->data, scale);
+    }
+    else if (2*nsm*WARP_SIZE >= nr) {
+        int nblock = (nr + 2*WARP_SIZE - 1)/(2*WARP_SIZE);
+        k_softmax_gemm_f32<<<nblock, 2*WARP_SIZE, 0, ctx.stream()>>>(src0->ne[0], src0->ne[1], src1->ne[1], ggml_nelements(dst),
+                src0->nb[1]/sizeof(float), src0->nb[2]/sizeof(float),
+                src1->nb[1]/sizeof(float), src1->nb[2]/sizeof(float),
+                (const float *)src0->data, (const float *)src1->data, (float *)dst->data, scale);
+    } else {
+        int nblock = (nr + 4*WARP_SIZE - 1)/(4*WARP_SIZE);
+        k_softmax_gemm_f32<<<nblock, 4*WARP_SIZE, 0, ctx.stream()>>>(src0->ne[0], src0->ne[1], src1->ne[1], ggml_nelements(dst),
+                src0->nb[1]/sizeof(float), src0->nb[2]/sizeof(float),
+                src1->nb[1]/sizeof(float), src1->nb[2]/sizeof(float),
+                (const float *)src0->data, (const float *)src1->data, (float *)dst->data, scale);
+    }
+
+    return true;
+}
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst, const ggml_cgraph * cgraph, int & i) {
 
 #if IK_PRINT_TIMING
@@ -4441,8 +4509,24 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_sub(ctx, dst);
             break;
         case GGML_OP_UNARY:
-            //printf("unary(%s, %s)\n", dst->name, ggml_unary_op_name((ggml_unary_op)dst->op_params[0]));
-            switch (ggml_get_unary_op(dst)) {
+            {
+            auto unary_op = ggml_get_unary_op(dst);
+            if (fusion && unary_op == GGML_UNARY_OP_TANH && i + 5 < cgraph->n_nodes &&
+                cgraph->nodes[i+1]->op == GGML_OP_SCALE &&
+                cgraph->nodes[i+2]->op == GGML_OP_MUL &&
+                cgraph->nodes[i+3]->op == GGML_OP_UNARY && ggml_get_unary_op(cgraph->nodes[i+3]) == GGML_UNARY_OP_TANH &&
+                cgraph->nodes[i+4]->op == GGML_OP_MUL &&
+                cgraph->nodes[i+5]->op == GGML_OP_ADD &&
+                cgraph->nodes[i+5]->src[0] == cgraph->nodes[i+2] &&
+                cgraph->nodes[i+5]->src[1] == cgraph->nodes[i+4] &&
+                cgraph->nodes[i+1]->src[0] == dst &&
+                cgraph->nodes[i+2]->src[0] == cgraph->nodes[i+1] &&
+                cgraph->nodes[i+4]->src[0] == cgraph->nodes[i+3] &&
+                ggml_cuda_op_inkling2_control(ctx, cgraph->nodes[i+5])) {
+                i += 5;
+                break;
+            }
+            switch (unary_op) {
                 case GGML_UNARY_OP_GELU:
                     ggml_cuda_op_gelu(ctx, dst);
                     break;
@@ -4520,7 +4604,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 default:
                     return -1;
             }
-            break;
+            } break;
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(dst)) {
                 case GGML_GLU_OP_REGLU:
@@ -4766,6 +4850,14 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     ggml_cuda_op_topk_moe(ctx, cgraph->nodes[i], cgraph->nodes[i+4], cgraph->nodes[i+3]);
                     i += 4;
                 }
+            } else if (fusion && i + 1 < cgraph->n_nodes &&
+                    cgraph->nodes[i+1]->op == GGML_OP_MUL_MAT &&
+                    cgraph->nodes[i+1]->src[1] == dst &&
+                    dst->ne[0] < 8 &&
+                    dst->type == GGML_TYPE_F32 &&
+                    cgraph->nodes[i+1]->src[0]->type == GGML_TYPE_F32 &&
+                    ggml_cuda_op_fused_softmax_small_gemm_f32(ctx, cgraph->nodes[i+1])) {
+                ++i;
             } else {
                 ggml_cuda_op_soft_max(ctx, dst);
             }

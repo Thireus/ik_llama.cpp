@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <vector>
 
 // Saved sources, each RMS-normalized once: keys [n_embd, n, n_tokens]; values, their transpose, for the loop bank.
@@ -39,11 +40,16 @@ static inkling_stack inkling_sources(ggml_context * ctx, const inkling_stack & b
 
 static ggml_tensor * inkling_mix(ggml_context * ctx, const inkling_stack & stack, ggml_tensor * partial, ggml_tensor * query) {
     auto keys = partial ? inkling_append(ctx, stack.keys, inkling_norm(ctx, partial)) : stack.keys;
-    auto scores = ggml_mul_mat(ctx, query, keys);
-    ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-    scores = ggml_cont(ctx, ggml_transpose(ctx, scores));
-    auto probs = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f / std::sqrt(float(keys->ne[0])), 0.0f);
     auto values = partial || !stack.values ? ggml_cont(ctx, ggml_transpose(ctx, keys)) : stack.values;
+    ggml_tensor * scores;
+    if (keys->ne[2] == 1) {
+        // avoid permute and contiguous by simply swapping the order of the GEMM operands
+        scores = ggml_mul_mat(ctx, keys, query);
+    } else {
+        scores = ggml_mul_mat(ctx, query, keys);
+        scores = ggml_cont(ctx, ggml_transpose(ctx, scores));
+    }
+    auto probs = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f / std::sqrt(float(keys->ne[0])), 0.0f);
     auto result = ggml_mul_mat(ctx, values, probs);
     ggml_mul_mat_set_prec(result, GGML_PREC_F32);
     return result;
@@ -55,13 +61,17 @@ static ggml_tensor * inkling_row(ggml_context * ctx, ggml_tensor * mixed, int in
 }
 
 static ggml_tensor * inkling_control(ggml_context * ctx, ggml_tensor * dest, ggml_tensor * message, ggml_tensor * down,
-        ggml_tensor * forget, ggml_tensor * gain, float eps) {
+        ggml_tensor * forget, ggml_tensor * gain, float eps, ggml_cgraph * gf) {
     auto d = ggml_rms_norm(ctx, dest, eps);
     auto m = ggml_rms_norm(ctx, message, eps);
     auto h = ggml_mul_mat(ctx, down, ggml_concat(ctx, d, m, 0));
     ggml_mul_mat_set_prec(h, GGML_PREC_F32);
     auto f = ggml_mul_mat(ctx, forget, h);
     auto g = ggml_mul_mat(ctx, gain, h);
+    if (gf) {
+        ggml_build_forward_expand(gf, f);
+        ggml_build_forward_expand(gf, g);
+    }
     ggml_mul_mat_set_prec(f, GGML_PREC_F32);
     ggml_mul_mat_set_prec(g, GGML_PREC_F32);
     auto keep = ggml_scale_bias(ctx, ggml_tanh(ctx, f), -1.0f, 1.0f);
@@ -129,9 +139,15 @@ static ggml_tensor * inkling_clip(ggml_context * ctx, ggml_tensor * x, ggml_tens
     //return ggml_mul(ctx, x, ggml_reshape(ctx, ggml_clamp(ctx, flat, 0.0f, 1.0f), factor));
 }
 
+struct inkling_shared {
+    std::map<const ggml_tensor *, ggml_tensor *> rel_bias;
+    std::map<int, ggml_tensor *> zero;
+    ggml_tensor * sink_column = nullptr;
+};
+
 static ggml_tensor * inkling_attention(llm_build_context & llm, ggml_cgraph * gf, int il,
         ggml_tensor * uq, ggml_tensor * uk, ggml_tensor * uv, ggml_tensor * mask,
-        ggml_tensor * tau) {
+        ggml_tensor * tau, inkling_shared & shared) {
     auto ctx = llm.ctx0;
     const auto & layer = llm.model.layers[il];
     const auto & hp = llm.hparams;
@@ -193,11 +209,24 @@ static ggml_tensor * inkling_attention(llm_build_context & llm, ggml_cgraph * gf
     q = ggml_permute(ctx, q, 0, 2, 1, 3);
     const float scale = 1.0f / std::sqrt(float(dk));
 
-    auto table = ggml_mul_mat(ctx, layer.attn_rel_bias, r);
-    table = ggml_pad(ctx, table, hp.inkling_relative_extent_max() + 1 - table->ne[0], 0, 0, 0);
+    auto & rel_bias = shared.rel_bias[layer.attn_rel_bias];
+    if (!rel_bias) {
+        rel_bias = ggml_pad(ctx, layer.attn_rel_bias, 0, GGML_PAD(hp.inkling_relative_extent_max() + 1, 32) - layer.attn_rel_bias->ne[1], 0, 0);
+        auto & column = shared.sink_column;
+        if (!column) {
+            column = ggml_fill(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, rel_bias->ne[1]), -1.0f);
+            column = ggml_pad(ctx, column, GGML_PAD(rel_bias->ne[0] + 1, 4) - rel_bias->ne[0] - 1, 0, 0, 0);
+        }
+        rel_bias = ggml_concat(ctx, rel_bias, column, 0);
+    }
     sinks = ggml_reshape_3d(ctx, sinks, 1, heads, tokens);
-    table = ggml_add(ctx, table, ggml_scale(ctx, sinks, -1.0f));
-    auto zero = ggml_fill(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, heads), 0.0f);
+    auto rs = ggml_concat(ctx, r, sinks, 0);
+    rs = ggml_pad(ctx, rs, rel_bias->ne[0] - rs->ne[0], 0, 0, 0);
+    auto table = ggml_mul_mat(ctx, rel_bias, rs);
+    auto & zero = shared.zero[heads];
+    if (!zero) {
+        zero = ggml_fill(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, heads), 0.0f);
+    }
     ggml_tensor * result;
     if (llm.flash_attn) {
         auto v_cache = kv.v_l[il];
@@ -272,6 +301,7 @@ ggml_cgraph * llm_build_context::build_inkling2_loop() {
     }
     inkling_stack blocks, pre_blocks, bank;
     ggml_tensor * pre = nullptr;
+    inkling_shared shared;
     for (int il = 0; il < n_layer; ++il) {
         const uint32_t ip = hparams.phys_layer(il);
         const auto & layer = model.layers[il];
@@ -301,7 +331,7 @@ ggml_cgraph * llm_build_context::build_inkling2_loop() {
         }
         auto blend = [&](ggml_tensor * dest, int stream) {
             return messages ? inkling_control(ctx0, dest, inkling_row(ctx0, messages, stream), layer.loop_ctrl_down[stream],
-                    layer.loop_ctrl_forget[stream], layer.loop_ctrl_gain[stream], norm_rms_eps) : dest;
+                    layer.loop_ctrl_forget[stream], layer.loop_ctrl_gain[stream], norm_rms_eps, gf) : dest;
         };
 
         const bool full = !hparams.swa_layers[il];
@@ -321,7 +351,7 @@ ggml_cgraph * llm_build_context::build_inkling2_loop() {
         } else {
             k = v = q;
         }
-        auto residual = inkling_attention(*this, gf, il, q, k, v, full ? mask : swa_mask, full ? lctx.inp_scale : nullptr);
+        auto residual = inkling_attention(*this, gf, il, q, k, v, full ? mask : swa_mask, full ? lctx.inp_scale : nullptr, shared);
         if (ip % hparams.attn_res_block_size == 0) {
             inkling_push(ctx0, blocks, x);
         } else {
