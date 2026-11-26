@@ -165,14 +165,17 @@ void llm_load_hparams(
     // get hparams kv
     ml.get_key(LLM_KV_VOCAB_SIZE, hparams.n_vocab, false) || ml.get_arr_n(LLM_KV_TOKENIZER_LIST, hparams.n_vocab, !ignore_vocab);
 
-    if (model.arch == LLM_ARCH_INKLING2_LOOP) {
-        if (hparams.n_layer > LLAMA_MAX_LAYERS) {
-            throw std::runtime_error("Inkling block count exceeds the supported layer count");
-        }
-        hparams.n_vocab_model = hparams.n_vocab;
-        ml.get_key(LLM_KV_VOCAB_SIZE_UNPADDED, hparams.n_vocab);
-        if (!hparams.n_vocab || hparams.n_vocab > hparams.n_vocab_model) {
-            throw std::runtime_error("invalid Inkling unpadded vocabulary size");
+    if (model.arch == LLM_ARCH_INKLING2_LOOP && hparams.n_layer > LLAMA_MAX_LAYERS) {
+        throw std::runtime_error("Inkling block count exceeds the supported layer count");
+    }
+    if (model.arch == LLM_ARCH_DFLASH2 || model.arch == LLM_ARCH_INKLING2_LOOP) {
+        uint32_t valid_vocab;
+        if (ml.get_key(LLM_KV_VOCAB_SIZE_UNPADDED, valid_vocab, model.arch == LLM_ARCH_INKLING2_LOOP)) {
+            if (valid_vocab == 0 || valid_vocab > hparams.n_vocab) {
+                throw std::runtime_error("invalid unpadded vocabulary size");
+            }
+            hparams.n_vocab_model = hparams.n_vocab;
+            hparams.n_vocab = valid_vocab;
         }
     }
 
@@ -1124,6 +1127,28 @@ void llm_load_hparams(
                 ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,      hparams.dsv4_hc_mult, false);
                 ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,    hparams.dsv4_hc_eps, false);
                 ml.get_key(LLM_KV_HYPER_CONNECTION_MAGNITUDE,  hparams.hc_magnitude, false);
+
+                // Optional reasoning-effort steering levels (absent from the preview).
+                ml.get_arr(LLM_KV_REASONING_EFFORT_LAYERS, model.reasoning_effort_layers, false);
+                ml.get_arr(LLM_KV_REASONING_EFFORT_NAMES,  model.reasoning_effort_names,  false);
+                ml.get_arr(LLM_KV_REASONING_EFFORT_ALPHA,  model.reasoning_effort_alphas, false);
+                ml.get_key(LLM_KV_REASONING_EFFORT_DEFAULT, model.reasoning_effort_default, false);
+                if (model.reasoning_effort_names.size() != model.reasoning_effort_alphas.size()) {
+                    LLAMA_LOG_WARN("%s: ignoring incomplete reasoning-effort metadata\n", __func__);
+                    model.reasoning_effort_names.clear();
+                    model.reasoning_effort_alphas.clear();
+                }
+                if (!model.reasoning_effort_names.empty()) {
+                    if (model.reasoning_effort_default.empty()) {
+                        model.reasoning_effort_default = "high";
+                    }
+                    for (size_t i = 0; i < model.reasoning_effort_names.size(); ++i) {
+                        if (model.reasoning_effort_names[i] == model.reasoning_effort_default) {
+                            model.reasoning_effort_default_alpha = model.reasoning_effort_alphas[i];
+                            break;
+                        }
+                    }
+                }
 
                 if (hparams.ssm_d_state == 0) {
                     hparams.ssm_d_state = 128;
@@ -2556,6 +2581,13 @@ void llm_load_hparams(
                 ml.get_key("dflash.conv_group_size",  hparams.dflash_conv_group_size);
                 ml.get_key("dflash.selector_rank",    hparams.dflash_selector_rank);
                 ml.get_key("dflash.selector_top_k",   hparams.dflash_selector_top_k);
+                std::string mode;
+                if (ml.get_key("dflash.selector_softcap_mode", mode, false)) {
+                    if (mode != "after_correction" && mode != "before_correction") {
+                        throw std::runtime_error("invalid DFlash2 selector_softcap_mode: " + mode);
+                    }
+                    hparams.dflash_softcap_after_correction = mode == "after_correction";
+                }
                 ml.get_key(LLM_KV_TOKENIZER_MASK_ID,       hparams.dflash_mask_token_id);
                 ml.get_key(LLM_KV_ATTENTION_CAUSAL,        hparams.causal_attn, false);
                 load_dflash_target_layer_ids(

@@ -106,6 +106,7 @@ struct llama_kv_cache {
     uint32_t head = 0;
     uint32_t size = 0;
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
+    uint32_t used_max = 0; // no cell at or above this index is used
 
     std::vector<uint32_t> row_count;
 
@@ -177,6 +178,7 @@ struct llama_kv_cache {
         std::vector<llama_kv_cell> cells_snapshot;
         uint32_t head_snapshot = 0;
         uint32_t used_snapshot = 0;
+        uint32_t used_max_snapshot = 0;
 
         std::vector<ggml_tensor *> s_l_shadow;
         // the standard Mamba-2 layout keeps the rolling conv window in the k-side cache, so a
@@ -198,6 +200,10 @@ struct llama_kv_cache {
         std::vector<int64_t> per_step_ple_dim;
         std::vector<int64_t> per_step_ple_offset;
 
+        std::vector<ggml_tensor *> conv_windows;
+        std::map<std::pair<llama_seq_id, int32_t>, std::vector<std::pair<ggml_backend_t, ggml_cgraph *>>> conv_restore_graphs;
+        llama_seq_id conv_slot = -1;
+        int32_t conv_offset = -1;
         int32_t per_step_n_tokens = 0;
         int32_t per_step_max_allocated = 0;
         int64_t per_step_ssm_state_size = 0;
@@ -266,6 +272,8 @@ struct llama_kv_cache {
             per_step_ple.clear();
             per_step_ple_dim.clear();
             per_step_ple_offset.clear();
+            conv_windows.clear();
+            conv_restore_graphs.clear();
             per_step_n_tokens = 0;
             per_step_max_allocated = 0;
             per_step_ssm_state_size = 0;
@@ -732,6 +740,9 @@ struct llama_context {
     struct ggml_tensor * inp_embd_enc;      // F32 [n_embd, n_outputs_enc]
     struct ggml_tensor * inp_KQ_mask_cross; // F32 [n_outputs_enc, n_batch]
     struct ggml_tensor * inp_scale = nullptr; // F32 [n_tokens]
+    struct ggml_tensor * inp_reasoning_effort = nullptr; // F32 [n_tokens], steering alpha per token
+    std::map<llama_seq_id, float> reasoning_effort_by_seq; // per-sequence alpha
+    std::vector<float> reasoning_effort_data;              // host staging for the input above
     struct ggml_tensor * inp_mtp_states = nullptr;
     struct ggml_tensor * inp_mtp_carry = nullptr; // F32 [n_embd, nextn-1] per-head hidden at the last committed position
     struct ggml_tensor * inp_dsa_sink = nullptr; // F32 [n_kv, n_tokens] per-sequence attention-sink boost for DSA indexer top-k

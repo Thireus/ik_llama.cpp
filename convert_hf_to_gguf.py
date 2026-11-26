@@ -708,6 +708,19 @@ class Model:
 
         return seems_special
 
+    def _set_vocab_inkling(self, dir_model, hparams):
+        tokens, types, pre = self.get_vocab_base(dir_model, vocab_size=hparams["unpadded_vocab_size"])
+        w = self.gguf_writer
+        w.add_tokenizer_model("gpt2")
+        w.add_tokenizer_pre(pre)
+        w.add_token_list(tokens)
+        w.add_token_types(types)
+        special = gguf.SpecialVocab(dir_model, load_merges=True, special_token_types=("eos", "pad"))
+        special.special_token_ids["eot"] = hparams["eos_token_id"]
+        special.add_special_token.update(bos=False, eos=False)
+        special.add_to_gguf(w)
+        w.add_bool("tokenizer.ggml.clean_spaces", False)
+
     # used for GPT-2 BPE and WordPiece vocabs
     def get_vocab_base(self, dir_model: Path | None = None, vocab_size: int | None = None) -> tuple[list[str], list[int], str]:
         tokens: list[str] = []
@@ -3674,7 +3687,9 @@ class DFlash2DraftModel(DFlashDraftModel):
         target_hparams = self._get_target_hparams()
         target_raw_hparams = self._get_target_raw_hparams()
         target_architectures = target_raw_hparams.get("architectures", [])
-        if "MuseGlimmerForConditionalGeneration" in target_architectures:
+        if "Inkling2LoopForConditionalGeneration" in target_architectures:
+            self._set_vocab_inkling(target_dir, target_hparams)
+        elif "MuseGlimmerForConditionalGeneration" in target_architectures:
             self._set_vocab_tokenizer_json(target_dir, int(target_hparams["vocab_size"]))
         else:
             super().set_vocab()
@@ -3703,7 +3718,14 @@ class DFlash2DraftModel(DFlashDraftModel):
         target_layer_ids = dflash_cfg.get("target_layer_ids")
         if target_layer_ids is None:
             raise ValueError("DFlash2DraftModel conversion requires target_layer_ids metadata")
-        target_layers = [int(value) + 1 for value in target_layer_ids]
+        inkling = "Inkling2LoopForConditionalGeneration" in self._get_target_raw_hparams().get("architectures", [])
+        if inkling:
+            self.gguf_writer.add_vocab_size(self.hparams["vocab_size"])
+            self.gguf_writer.add_uint32(f"{self.gguf_writer.arch}.vocab_size_unpadded",
+                                        self._get_target_hparams()["unpadded_vocab_size"])
+        target_layers = [int(value) + (0 if inkling else 1) for value in target_layer_ids]
+        if (mode := dflash_cfg.get("selector_softcap_mode")) is not None:
+            self.gguf_writer.add_string(f"{self.gguf_writer.arch}.selector_softcap_mode", mode)
         if not target_layers or any(value <= 0 for value in target_layers):
             raise ValueError("DFlash2DraftModel conversion requires target_layer_ids metadata")
         if len(set(target_layers)) != len(target_layers):
@@ -8935,17 +8957,7 @@ class Inkling2LoopModel(Model):
         super().prepare_metadata(vocab_only)
 
     def set_vocab(self):
-        tokens, types, pre = self.get_vocab_base(vocab_size=self.hparams["unpadded_vocab_size"])
-        w = self.gguf_writer
-        w.add_tokenizer_model("gpt2")
-        w.add_tokenizer_pre(pre)
-        w.add_token_list(tokens)
-        w.add_token_types(types)
-        special = gguf.SpecialVocab(self.dir_model, load_merges=True, special_token_types=("eos", "pad"))
-        special.special_token_ids["eot"] = self.hparams["eos_token_id"]
-        special.add_special_token.update(bos=False, eos=False)
-        special.add_to_gguf(w)
-        w.add_bool("tokenizer.ggml.clean_spaces", False)
+        self._set_vocab_inkling(self.dir_model, self.hparams)
 
     def set_gguf_parameters(self):
         hp = self.hparams
@@ -9131,9 +9143,23 @@ class Raon1Model(Model):
         self.gguf_writer.add_hyper_connection_count(self._with_default(hp, "raon_mhc_streams", 4))
         self.gguf_writer.add_hyper_connection_epsilon(self._with_default(hp, "raon_mhc_selector_eps", 1e-5))
         self.gguf_writer.add_hyper_connection_magnitude(self._with_default(hp, "raon_mhc_post_factor", 2.0))
+        # Optional reasoning-effort steering (absent from the preview).
+        # "none" means unsteered (alpha 0).
+        steering = hp.get("reasoning_effort_steering") or {}
+        alpha = steering.get("alpha") or {}
+        levels = [(name, float(value)) for name, value in alpha.items() if name != "none"]
+        if levels:
+            self.gguf_writer.add_reasoning_effort(
+                steering.get("layers", []),
+                [name for name, _ in levels],
+                [value for _, value in levels],
+                steering.get("default", "high"),
+            )
         self.gguf_writer.add_file_type(self.ftype)
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int):
+        if new_name.endswith(".ffn_effort_steer.weight"):
+            return gguf.GGMLQuantizationType.F32
         if ".hc_" in new_name and not new_name.endswith("_fn.weight"):
             return gguf.GGMLQuantizationType.F32
         quantized = tuple(t for t in (
@@ -9169,6 +9195,11 @@ class Raon1Model(Model):
             for kind, tensor in (("FN", fn), ("BASE", base), ("SCALE", scale)):
                 yield self.format_tensor_name(getattr(gguf.MODEL_TENSOR, f"{prefix}_{kind}"), bid), tensor
             del self._mhc[bid, site]
+            return
+
+        if name.endswith(".moe.reasoning_effort_steering"):
+            assert bid is not None
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.FFN_EFFORT_STEER, bid), data_torch.float()
             return
 
         if ".moe.experts." in name:

@@ -16638,6 +16638,20 @@ static bool ggml_compute_forward_concat_any_opt(
             }
             return true;
         }
+        if (dst->type == GGML_TYPE_F32 && src0->nb[0] == sizeof(float) && src1->nb[1] == sizeof(float) &&
+            dst->nb[0] == sizeof(float) && dst->ne[2]*dst->ne[3] == 1) {
+            const int nrows = dst->ne[1];
+            const int npt = (nrows + nth - 1)/nth;
+            for (int i1 = ith*npt; i1 < MIN((ith + 1)*npt, nrows); ++i1) {
+                float * y = (float *)((char *)dst->data + i1*dst->nb[1]);
+                memcpy(y, (const char *)src0->data + i1*src0->nb[1], src0->ne[0]*sizeof(float));
+                const char * c1 = (const char *)src1->data + i1*src1->nb[1];
+                for (int i0 = 0; i0 < src1->ne[0]; ++i0) {
+                    y[src0->ne[0] + i0] = *(const float *)(c1 + i0*src1->nb[0]);
+                }
+            }
+            return true;
+        }
     }
     if (dim != 0) {
         GGML_ASSERT(dst->ne[dim] == src0->ne[dim] + src1->ne[dim]);
@@ -25179,7 +25193,10 @@ static int ggml_compute_forward_ssm_conv(const struct ggml_compute_params * para
     switch (dst->src[0]->type) {
         case GGML_TYPE_F32:
             {
-                if (dst->src[4] == NULL) {
+                // Mamba-2 / Inkling2 layout (ggml_ssm_conv with sq == NULL) never sets src[3].
+                // src[4] (per-step saved conv states) is optional on the Qwen3-Next path, so
+                // it cannot tell the two layouts apart.
+                if (dst->src[3] == NULL) {
                     ggml_compute_forward_ssm_conv_m2_f32(params, dst);
                     return node;
                 }
@@ -25635,8 +25652,10 @@ static void ggml_compute_forward_kda_f32(int32_t ith, int32_t nth, struct ggml_t
         const float * beta_head = beta_data + batch_idx * bnb3 + head_idx * bnb2;
 
         float * state = state_working + state_head_offset;
-        for (int32_t i = 0; i < head_dim * head_dim; ++i) {
-            state[i] = state_in[state_head_offset + i];
+        if (state_working != state_in) {
+            for (int32_t i = 0; i < head_dim * head_dim; ++i) {
+                state[i] = state_in[state_head_offset + i];
+            }
         }
 
         const int32_t state_head_size = head_dim * head_dim;
@@ -25742,9 +25761,8 @@ static void ggml_compute_forward_delta_net_f32(
     float * state_working = src7 ? (float *) src7->data : out_data + output_size;
 
     if (src7) {
-        // src7 signals that the copy was fused away, so the op writes the state into its own
-        // input - safe because each thread seeds its heads from state_in before writing them
-        // back, and threads own disjoint heads
+        // src7 signals that the copy was fused away, so the op updates the state in its own
+        // input - safe because threads own disjoint heads
         GGML_ASSERT(src7->data == src5->data);
         GGML_ASSERT(src7->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_is_contiguous(src7));
@@ -25788,8 +25806,10 @@ static void ggml_compute_forward_delta_net_f32(
         const int64_t out_token_stride = head_dim * n_heads;
 
         float * state = state_working + state_head_offset;
-        for (int64_t i = 0; i < head_dim * head_dim; ++i) {
-            state[i] = state_in[state_head_offset + i];
+        if (state_working != state_in) {
+            for (int64_t i = 0; i < head_dim * head_dim; ++i) {
+                state[i] = state_in[state_head_offset + i];
+            }
         }
 
         const int64_t state_head_size = head_dim * head_dim;
@@ -30988,6 +31008,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     return 0;
 }
 
+// thread team of the last ggml_graph_compute, reused by ggml_parallel_host_copy
+#define GGML_HC_MAX_AFFINITY 1024
+static int     g_hc_n_threads = 0;
+static int     g_hc_n_aff     = 0;
+static int32_t g_hc_aff[GGML_HC_MAX_AFFINITY];
+
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     GGML_ASSERT(cplan);
     GGML_ASSERT(cplan->n_threads > 0);
@@ -31018,6 +31044,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
+        g_hc_n_aff = 0;
+        if (cplan->cpu_affinity != NULL && cplan->n_cpu_affinity > 0 && cplan->n_cpu_affinity <= GGML_HC_MAX_AFFINITY) {
+            memcpy(g_hc_aff, cplan->cpu_affinity, (size_t) cplan->n_cpu_affinity * sizeof(int32_t));
+            g_hc_n_aff = cplan->n_cpu_affinity;
+        }
 //#if IK_PRINT_TIMING
 //        int64_t tim1 = ggml_time_us();
 //#endif
@@ -31037,6 +31068,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             };
             ggml_graph_compute_thread(&worker);
         }
+        g_hc_n_threads = n_threads;
 //#if IK_PRINT_TIMING
 //        int64_t tim2 = ggml_time_us();
 //        printf("%s(...): %d us\n", __func__, (int)(tim2-tim1));
@@ -31090,6 +31122,55 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 #endif
 
     return state_shared.ec;
+}
+
+bool ggml_parallel_host_copy(const struct ggml_host_copy_range * items, int n_items) {
+#if defined(GGML_USE_OPENMP)
+    const int nt = g_hc_n_threads;
+    if (nt <= 1 || n_items <= 0) {
+        return false;
+    }
+#if defined(__gnu_linux__)
+    cpu_set_t saved_affinity;
+    const bool restore_affinity = pthread_getaffinity_np(pthread_self(), sizeof(saved_affinity), &saved_affinity) == 0;
+#endif
+    #pragma omp parallel num_threads(nt)
+    {
+        const int ith = omp_get_thread_num();
+        const int nth = omp_get_num_threads();
+        set_numa_thread_affinity(ith);
+#if defined(__gnu_linux__)
+        if (g_hc_n_aff > 0) {
+            const int cpu = g_hc_aff[ith % g_hc_n_aff];
+            if (cpu >= 0 && cpu < CPU_SETSIZE && sched_getcpu() != cpu) {
+                cpu_set_t mask;
+                CPU_ZERO(&mask);
+                CPU_SET(cpu, &mask);
+                pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask);
+            }
+        }
+#endif
+        for (int k = 0; k < n_items; ++k) {
+            const size_t bytes = items[k].bytes;
+            const size_t first = bytes * ith / nth;
+            const size_t last  = bytes * (ith + 1) / nth;
+            if (last > first) {
+                memcpy((char *) items[k].dst + first, (const char *) items[k].src + first, last - first);
+            }
+        }
+    }
+    clear_numa_thread_affinity();
+#if defined(__gnu_linux__)
+    if (restore_affinity) {
+        pthread_setaffinity_np(pthread_self(), sizeof(saved_affinity), &saved_affinity);
+    }
+#endif
+    return true;
+#else
+    UNUSED(items);
+    UNUSED(n_items);
+    return false;
+#endif
 }
 
 enum ggml_status ggml_graph_compute_with_ctx(struct ggml_context * ctx, struct ggml_cgraph * cgraph, int n_threads) {

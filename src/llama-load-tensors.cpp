@@ -3498,10 +3498,11 @@ bool create_tensors_helper::create_dflash2_tensors(const LLM_TN & tn) {
             {(int64_t) hparams.dflash_n_target_features, n_embd}, 0);
     model.output_norm = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
     model.dflash_hidden_norm = create_tensor(ctx_output, tn(LLM_TENSOR_DFLASH_HIDDEN_NORM, "weight"), {n_embd}, 0);
+    const int64_t codebook_rows = hparams.n_vocab_model ? hparams.n_vocab_model : n_vocab;
     model.dflash_selector_prev = create_tensor(ctx_output,
-            tn(LLM_TENSOR_DFLASH_SELECTOR_PREV, "weight"), {rank, n_vocab}, 0);
+            tn(LLM_TENSOR_DFLASH_SELECTOR_PREV, "weight"), {rank, codebook_rows}, 0);
     model.dflash_selector_next = create_tensor(ctx_output,
-            tn(LLM_TENSOR_DFLASH_SELECTOR_NEXT, "weight"), {rank, n_vocab}, 0);
+            tn(LLM_TENSOR_DFLASH_SELECTOR_NEXT, "weight"), {rank, codebook_rows}, 0);
     model.dflash_selector_hidden = create_tensor(ctx_output,
             tn(LLM_TENSOR_DFLASH_SELECTOR_HIDDEN, "weight"), {n_embd, rank}, 0);
 
@@ -5744,6 +5745,8 @@ bool create_tensors_helper::create_raon1_tensors(const LLM_TN & tn) {
             layer.ffn_gate_shexp = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", il), {n_embd, n_ff_shexp}, 0);
             layer.ffn_down_shexp = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", il), {n_ff_shexp, n_embd}, 0);
             layer.ffn_up_shexp   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", il), {n_embd, n_ff_shexp}, 0);
+            layer.ffn_effort_steer = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_EFFORT_STEER, "weight", il), {n_embd},
+                    llama_model_loader::TENSOR_NOT_REQUIRED);
         }
     }
 
