@@ -2,6 +2,7 @@
 #include "llama-hparams.h"
 #include "llama-model-loader.h"
 #include "llama-model.h"
+#include "llama-spec-features-dflash.h"
 
 #include <algorithm>
 #include <cmath>
@@ -105,10 +106,12 @@ static bool load_dflash_target_layer_ids(
     return true;
 }
 
-static void llama_hparams_normalize_dflash_target_layer_ids(llama_hparams & hparams, const char * model_kind) {
+static void llama_hparams_normalize_dflash_target_layer_ids(llama_hparams & hparams, [[maybe_unused]] const char * model_kind) {
     for (uint32_t i = 0; i < hparams.dflash_n_target_layers; ++i) {
         if (hparams.dflash_target_layer_ids[i] == 0) {
-            throw std::runtime_error(format("%s: target_layers must use one-based IDs", model_kind));
+            // 0 marks the final output norm rather than an execution layer
+            hparams.dflash_target_layer_ids[i] = (uint32_t) LLAMA_DFLASH_FINAL_LAYER_ID;
+            continue;
         }
         --hparams.dflash_target_layer_ids[i];
     }
